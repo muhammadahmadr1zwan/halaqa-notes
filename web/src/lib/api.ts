@@ -61,8 +61,24 @@ export function useSearch(query: string) {
 }
 
 /** Create (or open the existing) class for a YouTube video. */
-export async function addYouTubeClass(youtubeId: string): Promise<string> {
-  return (await api<{ id: string }>("/classes", { method: "POST", json: { youtube_id: youtubeId } })).id;
+export async function addYouTubeClass(youtubeId: string, aiOptOut = false): Promise<string> {
+  return (await api<{ id: string }>("/classes", { method: "POST", json: { youtube_id: youtubeId, ai_opt_out: aiOptOut } })).id;
+}
+
+/** Is the home computer that does the transcribing switched on? */
+export function useWorkerStatus() {
+  return useQuery({ queryKey: ["status"], queryFn: () => api<{ workerOnline: boolean; lastSeen: string | null }>("/status"), refetchInterval: 30_000 });
+}
+
+export interface PartialTranscript {
+  partsDone: number;
+  partsTotal: number;
+  segments: Array<{ start: number; end: number; text: string; speaker: string }>;
+}
+
+/** The unpolished transcript so far, while a long lecture is processing. */
+export function usePartial(id: string, enabled: boolean) {
+  return useQuery({ queryKey: ["partial", id], enabled, queryFn: () => api<PartialTranscript>(`/classes/${id}/partial`), refetchInterval: 30_000 });
 }
 
 /** Resumable upload in 4 MB parts: choosing the same file again continues where it stopped. */

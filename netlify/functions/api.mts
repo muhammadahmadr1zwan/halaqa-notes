@@ -134,6 +134,18 @@ async function deleteClass(s: Store, c: ClassRow) {
   await Promise.all(keys.map((k) => s.delete(k)));
 }
 
+const DAILY_LIMIT = 30;
+async function overDailyLimit(s: Store) {
+  const since = new Date(Date.now() - 86_400_000).toISOString();
+  return (await listJSON<ClassRow>(s, "class/")).filter((c) => c.created_at > since).length >= DAILY_LIMIT;
+}
+
+/** The home computer counts as online if it talked to us in the last 3 minutes. */
+async function touchWorker(s: Store) {
+  const prev = await getJSON<{ last_seen: string }>(s, "meta/worker");
+  if (!prev || Date.now() - Date.parse(prev.last_seen) > 30_000) await s.setJSON("meta/worker", { last_seen: now() });
+}
+
 // ───────────────────────── routing ─────────────────────────
 type Handler = (req: Request, m: string[], s: Store) => Promise<Response>;
 const routes: Array<[string, RegExp, Handler, "user" | "worker" | "public"]> = [];
@@ -143,10 +155,16 @@ const route = (method: string, pattern: string, auth: "user" | "worker" | "publi
 route("POST", "/login", "public", async (req) => {
   const { password } = (await req.json().catch(() => ({}))) as { password?: string };
   if (!env("APP_PASSWORD") || !env("SESSION_SECRET")) return fail(500, "The site isn't configured yet (APP_PASSWORD / SESSION_SECRET).");
+  const s = db();
+  const fails = (await getJSON<{ count: number; since: number }>(s, "meta/login-fails")) ?? { count: 0, since: Date.now() };
+  if (Date.now() - fails.since > 15 * 60_000) Object.assign(fails, { count: 0, since: Date.now() });
+  if (fails.count >= 10) return fail(429, "Too many attempts. Please wait 15 minutes and try again.");
   if (!password || !safeEqual(await sha256(password), await sha256(env("APP_PASSWORD")))) {
+    await s.setJSON("meta/login-fails", { ...fails, count: fails.count + 1 });
     await new Promise((r) => setTimeout(r, 800)); // slow down guessing
     return fail(401, "That password isn't right.");
   }
+  if (fails.count) await s.delete("meta/login-fails");
   return json({ token: await makeToken() });
 });
 
@@ -157,14 +175,27 @@ route("GET", "/classes", "user", async (_req, _m, s) => {
 });
 
 route("POST", "/classes", "user", async (req, _m, s) => {
-  const { youtube_id } = (await req.json()) as { youtube_id?: string };
+  const { youtube_id, ai_opt_out } = (await req.json()) as { youtube_id?: string; ai_opt_out?: boolean };
   if (!youtube_id || !/^[A-Za-z0-9_-]{11}$/.test(youtube_id)) return fail(400, "That doesn't look like a YouTube video.");
   const existing = await getJSON<{ id: string }>(s, `yt/${youtube_id}`);
   if (existing && (await getJSON(s, `class/${existing.id}`))) return json({ id: existing.id, existing: true });
-  const row = newClass({ source_type: "youtube", youtube_id, source_url: `https://www.youtube.com/watch?v=${youtube_id}` });
+  if (await overDailyLimit(s)) return fail(429, `You've added ${DAILY_LIMIT} lectures today. Please add more tomorrow.`);
+  const row = newClass({ source_type: "youtube", youtube_id, source_url: `https://www.youtube.com/watch?v=${youtube_id}`, ...({ ai_opt_out: !!ai_opt_out } as object) });
   await putClass(s, row);
   await s.setJSON(`yt/${youtube_id}`, { id: row.id });
   return json({ id: row.id }, 201);
+});
+
+route("GET", "/status", "user", async (_req, _m, s) => {
+  const w = await getJSON<{ last_seen: string }>(s, "meta/worker");
+  return json({ workerOnline: !!w && Date.now() - Date.parse(w.last_seen) < 3 * 60_000, lastSeen: w?.last_seen ?? null });
+});
+
+/** Transcript so far (unpolished) while a long lecture is still processing. */
+route("GET", "/classes/:id/partial", "user", async (_req, [id], s) => {
+  const chunks = (await getJSON<Array<{ idx: number; done: boolean; segments: Array<{ start: number; end: number; text: string; speaker: string }> | null }>>(s, `chunks/${id}`)) ?? [];
+  const done = chunks.filter((c) => c.done && c.segments);
+  return json({ partsDone: done.length, partsTotal: chunks.length, segments: done.sort((a, b) => a.idx - b.idx).flatMap((c) => c.segments!) });
 });
 
 route("GET", "/classes/:id", "user", async (_req, [id], s) => {
@@ -180,6 +211,7 @@ route("PATCH", "/classes/:id", "user", async (req, [id], s) => {
   if (typeof body.title === "string") allowed.title = body.title.slice(0, 300);
   if (body.class_date === null || typeof body.class_date === "string") allowed.class_date = body.class_date;
   if (body.speaker_names && typeof body.speaker_names === "object") allowed.speaker_names = body.speaker_names;
+  if (typeof (body as { ai_opt_out?: unknown }).ai_opt_out === "boolean") Object.assign(allowed, { ai_opt_out: (body as { ai_opt_out: boolean }).ai_opt_out });
   await putClass(s, { ...row, ...allowed });
   return json({ ok: true });
 });
@@ -252,6 +284,8 @@ route("GET", "/search", "user", async (req, _m, s) => {
 route("POST", "/uploads", "user", async (req, _m, s) => {
   const f = (await req.json()) as { name: string; size: number; type?: string; lastModified?: number };
   if (!f.name || !(f.size > 0)) return fail(400, "Missing file details.");
+  if (!/\.(mp3|m4a|aac|wav|ogg|opus|flac|wma|amr|mp4|m4v|mov|webm|mkv|3gp)$/i.test(f.name)) return fail(400, "Please choose an audio or video file (for example MP3, M4A or MP4).");
+  if (await overDailyLimit(s)) return fail(429, `You've added ${DAILY_LIMIT} lectures today. Please add more tomorrow.`);
   if (f.size > 2 * 1024 ** 3) return fail(400, "Files over 2 GB aren't supported. Please convert the recording to audio (MP3/M4A) first.");
   const fingerprint = `${f.name}:${f.size}:${f.lastModified ?? 0}`;
   const fp = await sha256(fingerprint);
@@ -393,6 +427,7 @@ export default async (req: Request): Promise<Response> => {
     if (auth === "user" && !(await validToken(req))) return fail(401, "Please sign in again.");
     if (auth === "worker" && (!env("WORKER_SECRET") || !safeEqual(req.headers.get("x-worker-secret") ?? "", env("WORKER_SECRET")))) return fail(401, "Bad worker secret");
     try {
+      if (auth === "worker") await touchWorker(db()).catch(() => {});
       return await handler(req, m.slice(1).map(decodeURIComponent), db());
     } catch (e) {
       console.error(e);

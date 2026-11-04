@@ -71,7 +71,9 @@ async function runClass(row: ClassRow) {
   log(`class ${row.id}: start (attempt ${row.attempts}, ${row.source_type})`);
   const started = Date.now();
   try {
-    await processClass(row, { store, media, stt, refiner, cfg, log: (m) => log(`class ${row.id}: ${m}`) });
+    // Private lectures never leave this computer: skip online AI polish.
+    const useRefiner = row.ai_opt_out ? null : refiner;
+    await processClass(row, { store, media, stt, refiner: useRefiner, cfg, log: (m) => log(`class ${row.id}: ${m}`) });
     log(`class ${row.id}: completed in ${Math.round((Date.now() - started) / 60000)} min`);
   } catch (e) {
     const je = toJobError(e);
@@ -108,12 +110,13 @@ async function runStudy(row: StudyRow) {
     if (!llm) throw new Error("AI study notes aren't set up yet. Add a free GEMINI_API_KEY or GROQ_API_KEY to the worker settings.");
     const [cls, doc] = await Promise.all([store.getClass(row.class_id), store.getTranscript(row.class_id)]);
     if (!cls || !doc) throw new Error("The transcript isn't ready yet.");
+    if (cls.ai_opt_out) throw Object.assign(new Error("This lecture is marked private, so study notes (which use an online AI service) are turned off for it."), { permanent: true });
     const { content, data } = await generateStudy(llm, row.kind, cls.title ?? "Class", cls.id, doc, cls.speaker_names ?? {});
     await store.updateStudy(row.id, { status: "completed", content, data, error: null, locked_by: null, locked_at: null });
   } catch (e) {
     const quota = e instanceof QuotaError;
     const msg = e instanceof RefusalError ? "The AI declined to generate this." : quota ? "The free AI quota is used up for today. It will try again automatically later." : (e as Error).message;
-    const retry = (quota || !(e instanceof RefusalError)) && row.attempts < (quota ? 10 : 3) && !!llm;
+    const retry = (quota || !(e instanceof RefusalError)) && !(e as { permanent?: boolean }).permanent && row.attempts < (quota ? 10 : 3) && !!llm;
     log(`study ${row.id}: failed (${(e as Error).message.slice(0, 300)})`);
     await store.updateStudy(row.id, {
       status: retry ? "queued" : "failed",

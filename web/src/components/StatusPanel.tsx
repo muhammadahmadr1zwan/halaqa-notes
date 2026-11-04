@@ -10,7 +10,7 @@ const STEPS = [
   { key: "finishing", label: "Saving" },
 ];
 
-export function StatusPanel({ cls, onRetried }: { cls: ClassRow; onRetried: () => void }) {
+export function StatusPanel({ cls, onRetried, workerOnline }: { cls: ClassRow; onRetried: () => void; workerOnline?: boolean }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -47,14 +47,25 @@ export function StatusPanel({ cls, onRetried }: { cls: ClassRow; onRetried: () =
 
   const stepIdx = Math.max(0, STEPS.findIndex((s) => s.key === cls.stage));
   const waiting = cls.status === "queued";
+  const offline = workerOnline === false;
+  const headline = offline
+    ? waiting
+      ? "Your lecture is in the queue"
+      : "Paused for now"
+    : waiting && cls.attempts === 0
+      ? "Added! Waiting to start…"
+      : "Processing your lecture…";
+  const detail = offline
+    ? "The home computer that prepares transcripts is switched off. Nothing is lost: it will continue automatically when the computer is turned on."
+    : cls.status_message || (waiting ? "It will start in a moment." : "Starting…");
   return (
     <Card className="p-6">
       <div className="flex items-center gap-3">
-        <Spinner className="size-6 text-brand" />
-        <h2 className="text-xl font-semibold">{waiting && cls.attempts === 0 ? "Waiting to start…" : "Working on your class…"}</h2>
+        {offline ? <Icon name="refresh" className="size-6 text-gold" /> : <Spinner className="size-6 text-brand" />}
+        <h2 className="text-xl font-semibold">{headline}</h2>
       </div>
       <ProgressBar value={cls.progress} className="mt-5" />
-      <p className="mt-3 text-lg">{cls.status_message || (waiting ? "In line — this usually starts within a minute." : "Starting…")}</p>
+      <p className="mt-3 text-lg">{detail}</p>
       <ol className="mt-6 grid gap-2 sm:grid-cols-4">
         {STEPS.map((s, i) => {
           const done = !waiting && i < stepIdx;

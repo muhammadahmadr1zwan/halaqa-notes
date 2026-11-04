@@ -2,7 +2,7 @@ import { lazy, Suspense, useCallback, useDeferredValue, useEffect, useMemo, useR
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { buildParagraphs, formatDuration, speakerName, toTxt, type ClassRow, type TranscriptDoc } from "@halaqa/shared";
-import { deleteClass, updateClassFields, useClass, useTranscript } from "../lib/api";
+import { deleteClass, updateClassFields, useClass, usePartial, useTranscript, useWorkerStatus } from "../lib/api";
 import { copyText, exportDocx, exportPdf, exportSrt, exportTxt, metaFor } from "../lib/exports";
 import { Header } from "../components/Header";
 import { Player, type PlayerHandle } from "../components/Player";
@@ -36,6 +36,7 @@ export function ClassPage() {
   const qc = useQueryClient();
   const c = cls.data;
   const transcript = useTranscript(id, c?.status === "completed");
+  const status = useWorkerStatus();
 
   return (
     <>
@@ -53,7 +54,8 @@ export function ClassPage() {
             <TitleBlock c={c} />
             {c.status !== "completed" ? (
               <div className="mt-6">
-                <StatusPanel cls={c} onRetried={() => qc.invalidateQueries({ queryKey: ["class", id] })} />
+                <StatusPanel cls={c} workerOnline={status.data?.workerOnline} onRetried={() => qc.invalidateQueries({ queryKey: ["class", id] })} />
+                {c.status !== "failed" && <PartialPreview id={c.id} />}
               </div>
             ) : transcript.isLoading ? (
               <Spinner className="mt-10 size-8 text-brand" />
@@ -211,7 +213,7 @@ export function Workspace({ c, doc }: { c: ClassRow; doc: TranscriptDoc }) {
             onClick={() => setTab(t)}
             className={`min-h-12 rounded-xl px-5 text-lg font-medium ${tab === t ? "bg-ink text-paper" : "bg-card border border-line hover:bg-brand-soft"}`}
           >
-            {t === "transcript" ? "Transcript" : "Study notes"}
+            {t === "transcript" ? "Transcript" : "Study Notes"}
           </button>
         ))}
       </div>
@@ -340,7 +342,7 @@ function ExportMenu({ c, doc }: { c: ClassRow; doc: TranscriptDoc }) {
       </Button>
       {open && (
         <div role="menu" className="absolute right-0 z-40 mt-2 w-64 rounded-xl border border-line bg-card p-1.5 shadow-lg">
-          {item("Word (.docx)", "Best for reading & printing", () => exportDocx(c, doc))}
+          {item("Download Word Document", "Best for reading, printing & sharing", () => exportDocx(c, doc))}
           {item("PDF", "Opens print view → Save as PDF", () => exportPdf(c))}
           {item("Text (.txt)", "Plain text with timestamps", () => exportTxt(c, doc))}
           {item("Subtitles (.srt)", "For video players", () => exportSrt(c, doc))}
@@ -454,5 +456,30 @@ export function PrintPage() {
         ))}
       </div>
     </main>
+  );
+}
+
+/** While a long lecture is processing, show what has been transcribed so far (not yet polished). */
+function PartialPreview({ id }: { id: string }) {
+  const partial = usePartial(id, true);
+  const p = partial.data;
+  if (!p || !p.segments.length) return null;
+  return (
+    <section className="mt-8">
+      <div className="mb-4 rounded-xl border border-line bg-card px-4 py-3">
+        <h2 className="text-lg font-semibold">
+          Early preview: {p.partsDone} of {p.partsTotal} parts ready
+        </h2>
+        <p className="text-muted">You can start reading now. The finished transcript, with paragraphs and headings, will replace this preview.</p>
+      </div>
+      <div className="transcript-text text-[1.12rem]">
+        {p.segments.map((s, i) => (
+          <p key={i} className="mb-3">
+            <span className="me-2 font-sans text-sm text-muted tabular-nums">{fmt(s.start)}</span>
+            <RichText text={s.text} />
+          </p>
+        ))}
+      </div>
+    </section>
   );
 }

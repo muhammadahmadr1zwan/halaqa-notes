@@ -69,10 +69,10 @@ describe("study notes on a small free context window (map-reduce)", () => {
     const notes = await generateStudy(llm, "notes", "Class", "c1", longDoc, {});
     const mapCalls = llm.prompts.length;
     expect(mapCalls).toBeGreaterThan(3);
-    expect(notes.content).toContain("## Part notes");
+    expect(notes.content).toBe("FINAL");
     const summary = await generateStudy(llm, "summary", "Class", "c1", longDoc, {});
     expect(summary.content).toBe("FINAL");
-    // per-part notes were reused: summary only added the final call (no condense needed here)
+    // per-part notes were reused: summary only added its own final call
     expect(llm.prompts.length).toBe(mapCalls + 1);
   });
 

@@ -46,6 +46,9 @@ html {
 }
 
 body {
+  /* iPad / iPhone home-screen app: keep content clear of rounded corners and the home bar */
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  -webkit-tap-highlight-color: transparent;
   background: var(--color-paper);
   color: var(--color-ink);
   font-family: var(--font-sans);

@@ -14,6 +14,19 @@ MODEL = os.environ.get("WHISPER_LOCAL_MODEL", "large-v3-turbo")
 DEVICE = os.environ.get("WHISPER_DEVICE", "auto")
 COMPUTE = os.environ.get("WHISPER_COMPUTE", "int8" if DEVICE in ("auto", "cpu") else "float16")
 BEAM = int(os.environ.get("WHISPER_BEAM", "5"))
+
+
+def physical_cores() -> int:
+    # Measured on an i9-11900H: 8 threads (= physical cores) ran 20% faster than 16 with identical output.
+    try:
+        import psutil
+
+        return psutil.cpu_count(logical=False) or 4
+    except Exception:
+        return max(1, (os.cpu_count() or 8) // 2)
+
+
+THREADS = int(os.environ.get("WHISPER_THREADS", "0")) or physical_cores()
 # An Arabic example in the prompt nudges Whisper to write Arabic in Arabic script.
 PROMPT = os.environ.get(
     "WHISPER_PROMPT",
@@ -23,8 +36,8 @@ PROMPT = os.environ.get(
 
 
 def main() -> None:
-    model = WhisperModel(MODEL, device=DEVICE, compute_type=COMPUTE, cpu_threads=os.cpu_count() or 4)
-    print(json.dumps({"ready": True, "model": MODEL}), flush=True)
+    model = WhisperModel(MODEL, device=DEVICE, compute_type=COMPUTE, cpu_threads=THREADS)
+    print(json.dumps({"ready": True, "model": MODEL, "threads": THREADS}), flush=True)
     for line in sys.stdin:
         path = line.strip()
         if not path:

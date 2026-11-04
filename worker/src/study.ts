@@ -51,8 +51,26 @@ export const GROUNDING = `You are helping a student review a recorded Islamic cl
 const PROMPTS: Record<Exclude<StudyKind, "glossary">, string> = {
   summary:
     "Write a summary of the whole class in Markdown: one short opening paragraph on what the class covered, then the main topics in the order they were taught, each as a short paragraph with its timestamp. Scale the length to the class (about 250 words per hour of class, at most 1,500 words). No preamble.",
-  notes:
-    "Write structured study notes in Markdown that follow the flow of the class. Use `##` headings for the main topics (with the timestamp where the topic starts, e.g. `## Patience in hardship [01:12:30]`), bullet points for the teacher's explanations, examples and stories, and quote the Quran/hadith/duas the teacher recited exactly as they appear. Include the teacher's answers to questions from students. No preamble.",
+  notes: `Write organized study notes in Markdown with exactly these sections (omit a section only if the class has nothing for it):
+## Lecture title
+A short descriptive title.
+## Summary
+3–6 sentences.
+## Main topics
+Bullet list in teaching order, each with its [HH:MM:SS].
+## Key Islamic lessons
+Bullets in the teacher's meaning, each with its [HH:MM:SS].
+## Qur'an references mentioned
+Only verses the teacher actually recited or named. Quote the Arabic exactly as it appears in the material; give the surah/ayah only if the teacher stated it, otherwise write "(surah/ayah not stated)". Mark anything unclear as "(uncertain)".
+## Hadith references mentioned
+Only hadith the teacher actually quoted or described, with the source and grading ONLY if the teacher stated them; otherwise write "(source not stated)". Never add book names, numbers or gradings yourself.
+## Important Arabic terms
+Term in Arabic script — brief meaning as explained in class.
+## Practical takeaways
+Bullets with [HH:MM:SS].
+## Key timestamps
+The most important moments: [HH:MM:SS] — what happens.
+No preamble.`,
   takeaways:
     "List the key takeaways a student should remember from this class, as a Markdown bullet list of 8–20 items. Each item is one or two sentences in the teacher's meaning, ending with its timestamp, e.g. `- Patience is ... [00:42:10]`. Include practical advice the teacher gave. No preamble.",
 };
@@ -120,7 +138,6 @@ export async function generateStudy(
     partNotesCache.clear();
     partNotesCache.set(cacheKey, partNotes);
   }
-  if (kind === "notes") return { content: partNotes.join("\n\n"), data: null };
 
   // Reduce: condense until the notes fit in one request, then write the summary / takeaways.
   let notes = partNotes;

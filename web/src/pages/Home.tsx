@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { formatDuration, parseYouTubeId, type ClassRow } from "@halaqa/shared";
-import { addYouTubeClass, uploadRecording, useClasses, useSearch } from "../lib/api";
+import { addYouTubeClass, uploadRecording, useClasses, useSearch, useWorkerStatus } from "../lib/api";
 import { Header } from "../components/Header";
 import { RichText } from "../components/RichText";
 import { Button, Card, Icon, ProgressBar, Spinner } from "../components/ui";
@@ -12,6 +12,7 @@ export function Home() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [uploadPct, setUploadPct] = useState<number | null>(null);
+  const [aiOptOut, setAiOptOut] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
 
   const submit = async () => {
@@ -23,7 +24,7 @@ export function Home() {
     setBusy(true);
     setError(null);
     try {
-      nav(`/class/${await addYouTubeClass(id)}`);
+      nav(`/class/${await addYouTubeClass(id, aiOptOut)}`);
     } catch (e) {
       setError((e as Error).message);
       setBusy(false);
@@ -46,8 +47,8 @@ export function Home() {
       <Header />
       <main className="mx-auto max-w-6xl px-4 pb-20">
         <section className="mx-auto max-w-3xl pt-10 pb-12 text-center sm:pt-16">
-          <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">Transcribe a class</h1>
-          <p className="mt-3 text-lg text-muted">Paste a YouTube link and press Transcribe. Arabic stays in Arabic.</p>
+          <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">Add a Lecture</h1>
+          <p className="mt-3 text-lg text-muted">Paste a YouTube link, then tap Transcribe Lecture. You can close this page afterwards.</p>
           <form
             className="mt-8 flex flex-col gap-3 sm:flex-row"
             onSubmit={(e) => {
@@ -84,12 +85,17 @@ export function Home() {
               )}
             </div>
             <Button variant="primary" type="submit" disabled={busy || !url.trim()} className="min-h-14 rounded-2xl px-8 text-lg">
-              {busy ? <Spinner /> : null} Transcribe
+              {busy ? <Spinner /> : null} Transcribe Lecture
             </Button>
           </form>
           {error && <p className="mt-4 rounded-xl bg-danger-soft px-4 py-3 text-left text-danger">{error}</p>}
 
-          <div className="mt-6">
+          <label className="mt-4 inline-flex min-h-11 cursor-pointer items-center gap-3 text-left text-muted">
+            <input type="checkbox" checked={aiOptOut} onChange={(e) => setAiOptOut(e.target.checked)} className="size-5 accent-[var(--color-brand)]" />
+            Private lecture: don't use online AI for its notes
+          </label>
+
+          <div className="mt-4">
             {uploadPct === null ? (
               <button onClick={() => fileInput.current?.click()} className="inline-flex min-h-11 items-center gap-2 rounded-xl px-4 text-brand hover:bg-brand-soft">
                 <Icon name="upload" /> Or upload a recording (audio or video file)
@@ -123,6 +129,8 @@ export function Home() {
 
 function Library() {
   const classes = useClasses();
+  const status = useWorkerStatus();
+  const waitingCount = (classes.data ?? []).filter((c) => c.status === "queued" || c.status === "processing").length;
   const [q, setQ] = useState("");
   const search = useSearch(q);
   const searching = q.trim().length >= 2;
@@ -132,7 +140,7 @@ function Library() {
   return (
     <section>
       <div className="mb-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <h2 className="text-2xl font-semibold">Your classes</h2>
+        <h2 className="text-2xl font-semibold">My Lectures</h2>
         {(classes.data?.length ?? 0) > 0 && (
           <label className="relative block sm:w-80">
             <Icon name="search" className="pointer-events-none absolute top-1/2 left-3.5 size-5 -translate-y-1/2 text-muted" />
@@ -146,6 +154,11 @@ function Library() {
         )}
       </div>
 
+      {waitingCount > 0 && status.data && !status.data.workerOnline && (
+        <p className="mb-5 rounded-xl border border-gold/40 bg-gold-soft px-4 py-3 text-lg">
+          The home computer that prepares transcripts is switched off right now. Your lectures are safely in the queue and will start automatically when it is turned on.
+        </p>
+      )}
       {classes.isLoading ? (
         <Spinner className="size-7 text-brand" />
       ) : classes.error ? (
@@ -191,10 +204,15 @@ function ClassCard({ c, snippet, query }: { c: ClassRow; snippet: string | null;
           {working && (
             <div className="mt-3">
               <ProgressBar value={c.progress} />
-              <p className="mt-1.5 truncate text-sm text-muted">{c.status_message || "Waiting to start…"}</p>
+              <p className="mt-1.5 truncate text-sm text-muted">{c.status === "queued" ? "In the queue" : "Processing"}{c.status_message ? ` · ${c.status_message}` : ""}</p>
             </div>
           )}
-          {c.status === "failed" && <p className="mt-3 text-sm font-medium text-danger">Couldn't finish – open for details</p>}
+          {c.status === "completed" && (
+            <p className="mt-3 inline-flex items-center gap-1.5 rounded-full bg-brand-soft px-3 py-1 text-sm font-semibold text-brand">
+              <Icon name="check" className="size-4" /> Ready to Read
+            </p>
+          )}
+          {c.status === "failed" && <p className="mt-3 text-sm font-medium text-danger">Couldn't finish – tap for details</p>}
           {snippet && (
             <p className="mt-3 line-clamp-3 rounded-lg bg-gold-soft px-3 py-2 text-sm">
               <RichText text={snippet} />

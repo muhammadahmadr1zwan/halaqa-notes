@@ -59,6 +59,8 @@ export interface ClassRow {
   provider: string | null;
   attempts: number;
   speaker_names: Record<string, string>;
+  /** Private lecture: never send its text to online AI services. */
+  ai_opt_out?: boolean;
   created_at: string;
   updated_at: string;
 }
