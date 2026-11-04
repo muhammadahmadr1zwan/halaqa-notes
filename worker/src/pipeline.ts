@@ -16,7 +16,7 @@ import type { Media } from "./media.ts";
 import { LlmError, QuotaError } from "./llm.ts";
 import { applyRefinement, makeBatches, type Refiner, type RefineResult } from "./refine.ts";
 import { mapPool, withRetry } from "./retry.ts";
-import { mapSpeakersDominant, offsetSegments, type RawSegment } from "./segmenting.ts";
+import { dropBoundaryRepeats, mapSpeakersDominant, offsetSegments, type RawSegment } from "./segmenting.ts";
 import type { Store } from "./store.ts";
 import { SttError, type SttProvider } from "./stt/types.ts";
 
@@ -129,7 +129,7 @@ export async function processClass(row: ClassRow, d: PipelineDeps): Promise<void
       } catch (e) {
         throw new JobError("STT_FAILED", "The transcription service had a problem. We'll retry automatically.", false, (e as Error).message);
       }
-      const segs = offsetSegments(mapSpeakersDominant(result.segments), c.start_s);
+      const segs = offsetSegments(dropBoundaryRepeats(mapSpeakersDominant(result.segments)), c.start_s);
       await store.saveChunk(row.id, c.idx, segs, stt.name);
       c.segments = segs;
       c.done = true;

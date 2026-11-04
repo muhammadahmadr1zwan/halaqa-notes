@@ -115,9 +115,13 @@ function newClass(fields: Partial<ClassRow> & Pick<ClassRow, "source_type">): Cl
   };
 }
 
-const claimable = (r: { status: string; next_attempt_at?: string; locked_at?: string | null }) =>
+/** Worker ids are "<hostname>-<pid>": a restarted worker on the same machine takes its old jobs back at once. */
+const sameHostRestart = (lockedBy: string | null | undefined, workerId: string) =>
+  !!lockedBy && lockedBy !== workerId && lockedBy.replace(/-\d+$/, "") === workerId.replace(/-\d+$/, "");
+
+const claimable = (workerId: string) => (r: { status: string; next_attempt_at?: string; locked_at?: string | null; locked_by?: string | null }) =>
   (r.status === "queued" && (!r.next_attempt_at || r.next_attempt_at <= now())) ||
-  (r.status === "processing" && (!r.locked_at || Date.parse(r.locked_at) < Date.now() - STALE_MS));
+  (r.status === "processing" && (!r.locked_at || Date.parse(r.locked_at) < Date.now() - STALE_MS || sameHostRestart(r.locked_by, workerId)));
 
 async function deleteClass(s: Store, c: ClassRow) {
   const keys = [`class/${c.id}`, `transcript/${c.id}`, `search/${c.id}`, `chunks/${c.id}`];
@@ -294,7 +298,7 @@ route("POST", "/uploads/:id/complete", "user", async (req, [id], s) => {
 // ───────────────────────── worker endpoints ─────────────────────────
 route("POST", "/worker/claim-class", "worker", async (req, _m, s) => {
   const { workerId } = (await req.json()) as { workerId: string };
-  const rows = (await listJSON<ClassRow & { next_attempt_at?: string; locked_at?: string | null }>(s, "class/")).filter(claimable);
+  const rows = (await listJSON<ClassRow & { next_attempt_at?: string; locked_at?: string | null; locked_by?: string | null }>(s, "class/")).filter(claimable(workerId));
   rows.sort((a, b) => a.created_at.localeCompare(b.created_at));
   const row = rows[0];
   if (!row) return json(null);
@@ -305,7 +309,7 @@ route("POST", "/worker/claim-class", "worker", async (req, _m, s) => {
 
 route("POST", "/worker/claim-study", "worker", async (req, _m, s) => {
   const { workerId } = (await req.json()) as { workerId: string };
-  const rows = (await listJSON<StudyRow>(s, "study/")).filter(claimable).sort((a, b) => a.created_at.localeCompare(b.created_at));
+  const rows = (await listJSON<StudyRow>(s, "study/")).filter(claimable(workerId)).sort((a, b) => a.created_at.localeCompare(b.created_at));
   const row = rows[0];
   if (!row) return json(null);
   const claimed = { ...row, status: "processing", attempts: row.attempts + 1, locked_by: workerId, locked_at: now(), updated_at: now() };

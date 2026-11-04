@@ -81,3 +81,35 @@ export function offsetSegments(segments: RawSegment[], offset: number): RawSegme
   const r = (n: number) => Math.round((n + offset) * 1000) / 1000;
   return segments.map((s) => ({ ...s, start: r(s.start), end: r(s.end) }));
 }
+
+const norm = (w: string) => w.toLowerCase().replace(/[^\p{L}\p{N}']/gu, "");
+
+/**
+ * Whisper sometimes repeats the last word(s) of a segment at the start of the next
+ * ("…daily prayers." / "prayers. Now…"). Remove the repeat when it is clearly an artifact:
+ * back-to-back segments and either 2+ repeated words, or one long word that ended a sentence.
+ */
+export function dropBoundaryRepeats(segments: RawSegment[]): RawSegment[] {
+  const out: RawSegment[] = [];
+  for (const seg of segments) {
+    const prev = out[out.length - 1];
+    if (prev && seg.start - prev.end < 1.5) {
+      const a = prev.text.split(/\s+/);
+      const b = seg.text.split(/\s+/);
+      for (let k = Math.min(6, a.length, b.length - 1); k >= 1; k--) {
+        const same = a.slice(-k).every((w, i) => norm(w) && norm(w) === norm(b[i]));
+        const strong = k >= 2 || (/[.?!؟]$/.test(a[a.length - 1]) && norm(b[0]).length >= 4);
+        if (same && strong) {
+          const rest = b.slice(k).join(" ");
+          out.push({ ...seg, text: rest.charAt(0).toUpperCase() + rest.slice(1) });
+          break;
+        }
+        if (k === 1) out.push(seg);
+      }
+      if (Math.min(6, a.length, b.length - 1) < 1) out.push(seg);
+      continue;
+    }
+    out.push(seg);
+  }
+  return out;
+}

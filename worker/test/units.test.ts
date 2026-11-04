@@ -4,7 +4,7 @@ import { parseFfmpegDuration, parseSilences, planChunks } from "../src/chunking.
 import { classifyYtDlpError } from "../src/errors.ts";
 import { applyRefinement, makeBatches } from "../src/refine.ts";
 import { checkRefinement } from "../src/refineGuard.ts";
-import { mapSpeakersDominant, offsetSegments, wordsToSegments } from "../src/segmenting.ts";
+import { dropBoundaryRepeats, mapSpeakersDominant, offsetSegments, wordsToSegments } from "../src/segmenting.ts";
 import { scribeToResult } from "../src/stt/elevenlabs.ts";
 import type { Segment } from "@halaqa/shared";
 
@@ -67,6 +67,20 @@ describe("segmenting", () => {
       ],
     });
     expect(r.segments).toEqual([{ start: 0, end: 1.2, text: "Bismillah الرحمن", speaker: "speaker_0" }]);
+  });
+});
+
+describe("whisper boundary repeats", () => {
+  const seg = (start: number, end: number, text: string) => ({ start, end, text, speaker: "S1" });
+  it("removes the repeated word Whisper puts at the start of the next segment", () => {
+    const out = dropBoundaryRepeats([seg(21.6, 29.6, "recited during their daily prayers."), seg(29.6, 35, "prayers. Now, if we look at these verses")]);
+    expect(out[1].text).toBe("Now, if we look at these verses");
+  });
+  it("removes multi-word repeats but keeps genuine short repetition and distant segments", () => {
+    expect(dropBoundaryRepeats([seg(0, 5, "the reward of a complete Hajj"), seg(5, 9, "complete Hajj. And then he said")])[1].text).toBe("And then he said");
+    expect(dropBoundaryRepeats([seg(0, 5, "it is very"), seg(5, 9, "very important")])[1].text).toBe("very important");
+    expect(dropBoundaryRepeats([seg(0, 5, "patience."), seg(9, 12, "patience. Again")])[1].text).toBe("patience. Again");
+    expect(dropBoundaryRepeats([seg(0, 5, "one"), seg(5, 6, "one")])[1].text).toBe("one");
   });
 });
 
