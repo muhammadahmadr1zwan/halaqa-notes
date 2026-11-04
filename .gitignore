@@ -1,0 +1,11 @@
+*.local
+*.log
+.DS_Store
+.env
+.env.local
+.netlify/
+dist/
+node_modules/
+worker/.tmp/
+worker/.venv/
+worker/eval-out/

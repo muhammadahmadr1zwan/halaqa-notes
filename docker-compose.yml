@@ -1,0 +1,15 @@
+# Run the free worker on any always-on Linux/Mac machine or NAS:  docker compose up -d --build
+services:
+  worker:
+    build: .
+    env_file: .env
+    environment:
+      # Paths inside the container (override the Windows paths in .env)
+      PYTHON_PATH: /opt/venv/bin/python
+      YTDLP_PATH: /opt/venv/bin/yt-dlp
+      FFMPEG_PATH: ffmpeg
+    restart: unless-stopped
+    volumes:
+      - halaqa-work:/tmp/halaqa # keeps partial downloads across restarts
+volumes:
+  halaqa-work:

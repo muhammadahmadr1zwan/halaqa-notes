@@ -1,0 +1,130 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-serif: "Literata", ui-serif, Georgia, serif;
+  --font-arabic: "Amiri", "Traditional Arabic", "Noto Naskh Arabic", serif;
+
+  --color-paper: #fbf8f1;
+  --color-card: #ffffff;
+  --color-ink: #1d2320;
+  --color-muted: #5e6a64;
+  --color-line: #e6e0d3;
+  --color-brand: #0f5c52;
+  --color-brand-strong: #0b4a42;
+  --color-brand-soft: #e3f0ec;
+  --color-gold: #a8823f;
+  --color-gold-soft: #f6ecd6;
+  --color-danger: #b42318;
+  --color-danger-soft: #fdecea;
+  --color-mark: #fde68a;
+  --color-active: #e8f3ef;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-paper: #121614;
+    --color-card: #1a201d;
+    --color-ink: #e9ece8;
+    --color-muted: #9aa6a0;
+    --color-line: #2c3531;
+    --color-brand: #5fb3a5;
+    --color-brand-strong: #7cc6b9;
+    --color-brand-soft: #1f2e2a;
+    --color-gold: #d3ad69;
+    --color-gold-soft: #2c261a;
+    --color-danger: #f38b80;
+    --color-danger-soft: #3a1f1c;
+    --color-mark: #7a5d0a;
+    --color-active: #1d2b27;
+  }
+}
+
+html {
+  font-size: 18px;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  margin: 0;
+}
+
+/* Arabic runs inside mixed text: isolated, right-to-left, larger, Quran-friendly font. */
+.ar {
+  font-family: var(--font-arabic);
+  font-size: 1.28em;
+  line-height: 1.6;
+  unicode-bidi: isolate;
+  direction: rtl;
+}
+
+.transcript-text {
+  font-family: var(--font-serif);
+  line-height: 1.75;
+}
+
+mark {
+  background: var(--color-mark);
+  color: inherit;
+  border-radius: 3px;
+  padding: 0 1px;
+}
+mark.current {
+  outline: 2px solid var(--color-gold);
+}
+
+.prose-study h2 {
+  font-size: 1.25rem;
+  font-weight: 600;
+  margin: 1.6em 0 0.5em;
+}
+.prose-study h1 {
+  font-size: 1.4rem;
+  font-weight: 700;
+  margin: 1.2em 0 0.5em;
+}
+.prose-study h3 {
+  font-weight: 600;
+  margin: 1.2em 0 0.4em;
+}
+.prose-study p {
+  margin: 0.7em 0;
+}
+.prose-study ul,
+.prose-study ol {
+  padding-inline-start: 1.4em;
+  margin: 0.6em 0;
+}
+.prose-study ul {
+  list-style: disc;
+}
+.prose-study ol {
+  list-style: decimal;
+}
+.prose-study li {
+  margin: 0.35em 0;
+}
+.prose-study blockquote {
+  border-inline-start: 3px solid var(--color-gold);
+  padding-inline-start: 0.9em;
+  color: var(--color-muted);
+}
+
+@media print {
+  html {
+    font-size: 12pt;
+  }
+  body {
+    background: white;
+    color: black;
+  }
+  .no-print {
+    display: none !important;
+  }
+  .print-break-avoid {
+    break-inside: avoid;
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "name": "halaqa-notes",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Private English + Arabic transcription for long Islamic classes",
+  "workspaces": [
+    "shared",
+    "worker",
+    "web"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w web",
+    "build": "npm run build -w web",
+    "worker": "npm run start -w worker",
+    "test": "vitest run",
+    "typecheck": "tsc -p shared && tsc -p worker && tsc -p web --noEmit && tsc -p netlify",
+    "eval:stt": "npm run eval -w worker --"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "vitest": "^3.2.0"
+  },
+  "dependencies": {
+    "@netlify/blobs": "^10.7.13"
+  }
+}
