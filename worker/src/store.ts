@@ -36,7 +36,8 @@ export interface Store {
   updateClass(id: string, patch: Record<string, unknown>): Promise<void>;
   listChunks(classId: string): Promise<ChunkRow[]>;
   createChunks(classId: string, plan: ChunkPlan[]): Promise<void>;
-  saveChunk(classId: string, idx: number, segments: RawSegment[], provider: string): Promise<void>;
+  /** `owner`: refuse the save unless this run still holds the lecture's lock (cloud runs). */
+  saveChunk(classId: string, idx: number, segments: RawSegment[], provider: string, owner?: string): Promise<void>;
   listRefineBatches(classId: string): Promise<Map<number, RefineResult>>;
   saveRefineBatch(classId: string, idx: number, result: RefineResult): Promise<void>;
   saveTranscript(t: TranscriptRecord): Promise<void>;
@@ -85,6 +86,10 @@ export class HttpStore implements Store {
   cloudIdle() {
     return this.call<{ next: string | null }>("POST", "/cloud-idle", {});
   }
+  /** Cloud runner only: one run at a time (acquire), and report its running time when done (release). */
+  cloudLease(runner: string, release = false, seconds = 0) {
+    return this.call<{ ok: boolean; reason?: string }>("POST", "/cloud-lease", { runner, release, seconds });
+  }
   claimClass(workerId: string) {
     return this.call<ClassRow | null>("POST", "/claim-class", { workerId });
   }
@@ -105,8 +110,8 @@ export class HttpStore implements Store {
     const rows = plan.map((p) => ({ idx: p.idx, start_s: p.start, end_s: p.end, segments: null, provider: null, done: false }));
     await this.call("PUT", `/classes/${classId}/chunks`, rows);
   }
-  async saveChunk(classId: string, idx: number, segments: RawSegment[], provider: string) {
-    await this.call("PUT", `/classes/${classId}/chunks/${idx}`, { segments, provider, done: true });
+  async saveChunk(classId: string, idx: number, segments: RawSegment[], provider: string, owner?: string) {
+    await this.call("PUT", `/classes/${classId}/chunks/${idx}`, { segments, provider, done: true, ...(owner ? { owner } : {}) });
   }
   async listRefineBatches(classId: string) {
     const obj = (await this.call<Record<string, RefineResult> | null>("GET", `/classes/${classId}/refine`)) ?? {};

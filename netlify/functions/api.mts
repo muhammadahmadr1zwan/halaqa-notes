@@ -131,7 +131,7 @@ async function deleteClass(s: Store, c: ClassRow) {
   const keys = [`class/${c.id}`, `transcript/${c.id}`, `search/${c.id}`, `chunks/${c.id}`];
   if (c.youtube_id) keys.push(`yt/${c.youtube_id}`);
   if (c.upload_fingerprint) keys.push(`fp/${await sha256(c.upload_fingerprint)}`, `upload-fp/${await sha256(c.upload_fingerprint)}`);
-  for (const prefix of [`refine/${c.id}/`, `study/${c.id}/`, ...(c.storage_path ? [`upload/${c.storage_path}/`] : [])]) {
+  for (const prefix of [`refine/${c.id}/`, `part/${c.id}/`, `study/${c.id}/`, ...(c.storage_path ? [`upload/${c.storage_path}/`] : [])]) {
     const { blobs } = await s.list({ prefix });
     keys.push(...blobs.map((b) => b.key));
   }
@@ -168,6 +168,30 @@ async function kickCloud(s: Store) {
   await fetch(`${base}/.netlify/functions/cloud-background`, { method: "POST", headers: { "x-worker-secret": env("WORKER_SECRET") } }).catch(() => {});
 }
 
+// ── free-allowance guard: Netlify's free plan includes 100 GB-hours of function time a month ──
+const LEASE_MS = 15.5 * 60_000; // longer than a background function can live (15 min)
+const usageKey = () => `meta/cloud-usage/${now().slice(0, 7)}`;
+const budgetSeconds = () => Number(env("CLOUD_MONTHLY_HOURS") || 40) * 3600;
+const cloudUsage = async (s: Store) => (await getJSON<{ seconds: number }>(s, usageKey()))?.seconds ?? 0;
+async function addCloudUsage(s: Store, seconds: number) {
+  for (let i = 0; i < 5 && seconds > 0; i++) {
+    const cur = await s.getWithMetadata(usageKey(), { type: "json" });
+    const next = { seconds: ((cur?.data as { seconds?: number } | null)?.seconds ?? 0) + seconds, updated_at: now() };
+    // `cur?.etag` can be falsy even when the blob exists (seen in the local Blobs emulator); gate the CAS mode on
+    // whether we read a document at all, not on etag truthiness, or an existing blob falls into onlyIfNew and every
+    // write is rejected forever.
+    const res = await s.setJSON(usageKey(), next, cur ? (cur.etag ? { onlyIfMatch: cur.etag } : {}) : { onlyIfNew: true });
+    if (!res || res.modified !== false) return;
+  }
+}
+const cloudAvailable = async (s: Store) => cloudEnabled() && (await cloudUsage(s)) < budgetSeconds();
+/** Monthly online allowance used up: waiting cloud lectures finish on the home computer instead. */
+async function handCloudJobsHome(s: Store) {
+  const rows = (await listJSON<ClassRow & CloudFields>(s, "class/")).filter((r) => r.engine === "cloud" && r.status === "queued");
+  for (const r of rows)
+    await putClass(s, { ...r, engine: "local", status_message: "This month's free online transcription time is used up, so this will finish on the home computer next time it's on." } as ClassRow);
+}
+
 // ───────────────────────── routing ─────────────────────────
 type Handler = (req: Request, m: string[], s: Store) => Promise<Response>;
 const routes: Array<[string, RegExp, Handler, "user" | "worker" | "public"]> = [];
@@ -202,7 +226,7 @@ route("POST", "/classes", "user", async (req, _m, s) => {
   const existing = await getJSON<{ id: string }>(s, `yt/${youtube_id}`);
   if (existing && (await getJSON(s, `class/${existing.id}`))) return json({ id: existing.id, existing: true });
   if (await overDailyLimit(s)) return fail(429, `You've added ${DAILY_LIMIT} lectures today. Please add more tomorrow.`);
-  const engine = !ai_opt_out && cloudEnabled() ? "cloud" : "local";
+  const engine = !ai_opt_out && (await cloudAvailable(s)) ? "cloud" : "local";
   const row = newClass({ source_type: "youtube", youtube_id, source_url: `https://www.youtube.com/watch?v=${youtube_id}`, ...({ ai_opt_out: !!ai_opt_out, engine } as object) });
   await putClass(s, row);
   await s.setJSON(`yt/${youtube_id}`, { id: row.id });
@@ -384,11 +408,52 @@ route("POST", "/worker/claim-class", "worker", async (req, _m, s) => {
 route("POST", "/worker/claim-study", "worker", async (req, _m, s) => {
   const { workerId } = (await req.json()) as { workerId: string };
   const rows = (await listJSON<StudyRow>(s, "study/")).filter(claimable(workerId)).sort((a, b) => a.created_at.localeCompare(b.created_at));
-  const row = rows[0];
-  if (!row) return json(null);
-  const claimed = { ...row, status: "processing", attempts: row.attempts + 1, locked_by: workerId, locked_at: now(), updated_at: now() };
-  await s.setJSON(`study/${row.class_id}/${row.kind}`, claimed);
-  return json(claimed);
+  for (const candidate of rows) {
+    const key = `study/${candidate.class_id}/${candidate.kind}`;
+    const cur = await s.getWithMetadata(key, { type: "json" });
+    const row = cur?.data as StudyRow | undefined;
+    if (!cur || !row || !claimable(workerId)(row)) continue;
+    const claimed = { ...row, status: "processing", attempts: row.attempts + 1, locked_by: workerId, locked_at: now(), updated_at: now() };
+    const res = await s.setJSON(key, claimed, cur.etag ? { onlyIfMatch: cur.etag } : {});
+    if (res && res.modified === false) continue; // another run got it first
+    return json(claimed);
+  }
+  return json(null);
+});
+
+/** One cloud run at a time (scheduler, self-restart and API kicks can all fire together); track its time. */
+/**
+ * Atomic: every acquisition (first ever, after a release, or taking over from a crashed run) must CREATE the key
+ * `meta/cloud-lease-gen/<n+1>` with onlyIfNew. Storage lets exactly one caller create it, so two workers that both
+ * saw the same expired lease can't both win - no reliance on etags. The lease outlives any run (15.5 > 15 min),
+ * so a run is always dead before another can take over its work.
+ */
+type Lease = { runner: string; until: string; gen?: number };
+route("POST", "/worker/cloud-lease", "worker", async (req, _m, s) => {
+  const { runner, release, seconds } = (await req.json()) as { runner: string; release?: boolean; seconds?: number };
+  const lease = await getJSON<Lease>(s, "meta/cloud-lease");
+  if (release) {
+    // Only the current owner, and only while its lease is clearly still live: a takeover needs the lease to have
+    // expired, so with ≥ 5 s left nobody else can have taken it between this read and the write below. A late
+    // release (lease expired or already taken over) changes nothing and isn't counted — the run that takes over
+    // counts it as a full 15 minutes instead, so time is never counted twice.
+    if (lease?.runner !== runner || Date.parse(lease.until) < Date.now() + 5_000) return json({ ok: true, late: true });
+    await s.setJSON("meta/cloud-lease", { ...lease, until: new Date(0).toISOString() }); // released; keeps `gen`
+    await addCloudUsage(s, Math.min(Math.max(0, seconds ?? 0), 900));
+    return json({ ok: true });
+  }
+  if (lease && Date.parse(lease.until) > Date.now()) return json({ ok: false, reason: "busy" });
+  if ((await cloudUsage(s)) >= budgetSeconds()) {
+    await handCloudJobsHome(s);
+    return json({ ok: false, reason: "budget" });
+  }
+  const gen = (lease?.gen ?? 0) + 1;
+  const won = await s.setJSON(`meta/cloud-lease-gen/${gen}`, { runner, at: now() }, { onlyIfNew: true });
+  if (won && won.modified === false) return json({ ok: false, reason: "busy" }); // another worker took this turn
+  await s.setJSON("meta/cloud-lease", { runner, until: new Date(Date.now() + LEASE_MS).toISOString(), gen });
+  if (gen > 50) await s.delete(`meta/cloud-lease-gen/${gen - 50}`); // tidy; far too old for any worker to race on
+  if (lease && Date.parse(lease.until) > 0) await addCloudUsage(s, 900); // previous run died without reporting: count 15 min
+  return json({ ok: true });
 });
 
 /** The cloud runner found nothing to do: remember when the earliest waiting cloud job is due (or clear). */
@@ -416,16 +481,35 @@ route("PATCH", "/worker/classes/:id", "worker", async (req, [id], s) => {
   return json({ ok: true });
 });
 
-route("GET", "/worker/classes/:id/chunks", "worker", async (_req, [id], s) => json((await getJSON(s, `chunks/${id}`)) ?? []));
+/** The window plan lives in `chunks/<id>`; each finished window is its own create-only blob `part/<id>/<idx>`. */
+type ChunkPlanRow = { idx: number; start_s: number; end_s: number; done?: boolean; segments?: unknown; provider?: string | null };
+route("GET", "/worker/classes/:id/chunks", "worker", async (_req, [id], s) => {
+  const plan = (await getJSON<ChunkPlanRow[]>(s, `chunks/${id}`)) ?? [];
+  const { blobs } = await s.list({ prefix: `part/${id}/` });
+  const parts = new Map(
+    await Promise.all(blobs.map(async (b) => [Number(b.key.split("/").pop()), await getJSON<ChunkPlanRow>(s, b.key)] as const)),
+  );
+  return json(
+    plan.map((r) => {
+      const p = parts.get(r.idx);
+      // Only a part made for exactly this window counts (guards against a re-planned lecture).
+      return p && p.start_s === r.start_s && p.end_s === r.end_s ? { ...r, segments: p.segments, provider: p.provider, done: true } : r;
+    }),
+  );
+});
 route("PUT", "/worker/classes/:id/chunks", "worker", async (req, [id], s) => {
   await s.setJSON(`chunks/${id}`, await req.json());
   return json({ ok: true });
 });
 route("PUT", "/worker/classes/:id/chunks/:idx", "worker", async (req, [id, idx], s) => {
-  const patch = (await req.json()) as object;
-  const updated = ((await getJSON<Array<{ idx: number }>>(s, `chunks/${id}`)) ?? []).map((r) => (r.idx === Number(idx) ? { ...r, ...patch } : r));
-  await s.setJSON(`chunks/${id}`, updated);
-  return json({ ok: true });
+  const { owner, segments, provider } = (await req.json()) as { owner?: string; segments: unknown; provider?: string };
+  // Fenced: a run that lost its lock can't write.
+  if (owner && (await getJSON<{ locked_by?: string | null }>(s, `class/${id}`))?.locked_by !== owner) return fail(409, "This lecture is no longer assigned to this run.");
+  const w = ((await getJSON<ChunkPlanRow[]>(s, `chunks/${id}`)) ?? []).find((r) => r.idx === Number(idx));
+  if (!w) return fail(404, "No such part.");
+  // Its own blob, created at most once: parallel windows never overwrite each other, and a repeat can't duplicate.
+  const res = await s.setJSON(`part/${id}/${idx}`, { start_s: w.start_s, end_s: w.end_s, segments, provider, saved_at: now() }, { onlyIfNew: true });
+  return json({ ok: true, already: !!res && res.modified === false });
 });
 
 route("GET", "/worker/classes/:id/refine", "worker", async (_req, [id], s) => {
@@ -443,8 +527,8 @@ route("PUT", "/worker/classes/:id/transcript", "worker", async (req, [id], s) =>
   await s.setJSON(`transcript/${id}`, { doc: t.doc, word_count: t.word_count });
   await s.setJSON(`search/${id}`, { class_id: id, search_text: t.search_text });
   // Intermediate state is no longer needed once the transcript is saved.
-  const { blobs } = await s.list({ prefix: `refine/${id}/` });
-  await Promise.all([...blobs.map((b) => s.delete(b.key)), s.delete(`chunks/${id}`)]);
+  const old = [...(await s.list({ prefix: `refine/${id}/` })).blobs, ...(await s.list({ prefix: `part/${id}/` })).blobs];
+  await Promise.all([...old.map((b) => s.delete(b.key)), s.delete(`chunks/${id}`)]);
   return json({ ok: true });
 });
 route("GET", "/worker/classes/:id/transcript", "worker", async (_req, [id], s) => {

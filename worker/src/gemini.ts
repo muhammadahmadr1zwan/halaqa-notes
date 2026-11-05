@@ -12,12 +12,16 @@ export class GeminiError extends Error {
     /** 429/5xx/network: try again later. Anything else: Gemini can't read this video. */
     public retryable: boolean,
     public perDay = false,
+    /** Gemini answered with (almost) nothing — also what it does when the clip ends past the video's real end. */
+    public empty = false,
   ) {
     super(message);
   }
 }
 
-export const GEMINI_YT_MODELS = (process.env.GEMINI_YT_MODELS || "gemini-3.8-flash,gemini-3.5-flash").split(",").map((s) => s.trim()).filter(Boolean);
+const FPS = Number(process.env.GEMINI_FPS) || 0;
+
+export const GEMINI_YT_MODELS =(process.env.GEMINI_YT_MODELS || "gemini-3.8-flash,gemini-3.5-flash").split(",").map((s) => s.trim()).filter(Boolean);
 
 const PROMPT =
   "Transcribe the speech in this video clip VERBATIM. It is an Islamic class in English; Qur'an verses, hadith and duas are " +
@@ -28,7 +32,7 @@ const PROMPT =
   "If there is no speech, output nothing.";
 
 /** Transcribe [start, end) seconds of a public YouTube video. Returns segments in absolute seconds. */
-export async function geminiYouTubeWindow(apiKey: string, model: string, youtubeId: string, start: number, end: number): Promise<RawSegment[]> {
+export async function geminiYouTubeWindow(apiKey: string, model: string, youtubeId: string, start: number, end: number, timeoutMs = 6 * 60_000): Promise<RawSegment[]> {
   let res: Response;
   try {
     res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
@@ -38,14 +42,19 @@ export async function geminiYouTubeWindow(apiKey: string, model: string, youtube
         contents: [
           {
             parts: [
-              { file_data: { file_uri: youTubeWatchUrl(youtubeId) }, video_metadata: { start_offset: `${start}s`, end_offset: `${end}s` } },
+              {
+                file_data: { file_uri: youTubeWatchUrl(youtubeId) },
+                // Opt-in (GEMINI_FPS=0.5): on a 5-min clip it cut video tokens ~36% with the same words, but the first
+                // 20-min window run at 0.5 fps came back covering only 4 of its 20 minutes. Not proven safe yet.
+                video_metadata: { start_offset: `${start}s`, end_offset: `${+end.toFixed(3)}s`, ...(FPS ? { fps: FPS } : {}) },
+              },
               { text: PROMPT },
             ],
           },
         ],
         generationConfig: { temperature: 0, mediaResolution: "MEDIA_RESOLUTION_LOW", maxOutputTokens: 60_000 },
       }),
-      signal: AbortSignal.timeout(6 * 60_000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (e) {
     throw new GeminiError(`network: ${(e as Error).message}`, 0, true);
@@ -73,7 +82,7 @@ export async function geminiYouTubeWindow(apiKey: string, model: string, youtube
   const answered = countWords(text.replace(/\[[\d:.]+\]/g, ""));
   const kept = segs.reduce((n, s) => n + countWords(s.text), 0);
   // A lecture window with (almost) no words is far more likely a failed read than silence: retry, never save it as done.
-  if (end - start >= 120 && kept < 5) throw new GeminiError(`${model}: empty answer for ${Math.round(end - start)} s of video`, 200, true);
+  if (end - start >= 120 && kept < 5) throw new GeminiError(`${model}: empty answer for ${Math.round(end - start)} s of video`, 200, true, false, true);
   if (answered > 30 && kept < answered * 0.9) throw new GeminiError(`${model}: only ${kept} of ${answered} words had usable timestamps`, 200, true);
   return segs;
 }
@@ -103,8 +112,14 @@ export function parseTimedLines(text: string, start: number, end: number): RawSe
   return rows.map((r, i) => ({ start: r.t, end: Math.max(r.t + 0.5, Math.min(rows[i + 1]?.t ?? end, end)), text: r.text, speaker: "S1" }));
 }
 
-/** Title/channel/thumbnail (oEmbed) and duration (watch page) without downloading anything. */
-export async function youTubeInfo(youtubeId: string): Promise<{ title: string | null; channel: string | null; thumbnail: string | null; duration: number | null }> {
+/**
+ * Title/channel/thumbnail (oEmbed) and duration (watch page) without downloading anything.
+ * `exactEnd`: the shortest stream's precise length (approxDurationMs). Gemini returns an empty answer if a clip
+ * ends even slightly past the real end, and the listed length is rounded UP (3643 vs 3642.57 s measured).
+ */
+export async function youTubeInfo(
+  youtubeId: string,
+): Promise<{ title: string | null; channel: string | null; thumbnail: string | null; duration: number | null; exactEnd: number | null }> {
   const url = youTubeWatchUrl(youtubeId);
   const [o, page] = await Promise.all([
     fetch(`https://www.youtube.com/oembed?format=json&url=${encodeURIComponent(url)}`, { signal: AbortSignal.timeout(20_000) })
@@ -121,5 +136,7 @@ export async function youTubeInfo(youtubeId: string): Promise<{ title: string | 
     const [h, m, s] = len.split(":").map((x) => Number(x || 0));
     duration = h * 3600 + m * 60 + s;
   }
-  return { title: o?.title ?? null, channel: o?.author_name ?? null, thumbnail: o?.thumbnail_url ?? null, duration: duration || null };
+  const ms = [...page.matchAll(/"approxDurationMs":"(\d+)"/g)].map((m) => Number(m[1])).filter((n) => n > 0);
+  const exactEnd = ms.length ? Math.min(...ms) / 1000 : null;
+  return { title: o?.title ?? null, channel: o?.author_name ?? null, thumbnail: o?.thumbnail_url ?? null, duration: duration || null, exactEnd };
 }

@@ -1,14 +1,14 @@
 /**
  * Cloud path (runs inside a Netlify Background Function): public YouTube lectures are transcribed by Gemini
  * window by window, so neither the home computer nor the iPad needs to be on. Each finished window is saved
- * at once (resumable); Google "busy"/quota errors wait and retry later instead of giving up.
+ * at once (resumable). When Google is busy or out of quota the job records WHEN to try again and the run
+ * ends — no paid compute is spent sleeping; the scheduled `cloud-kick` starts a new run when it's due.
  */
 import type { ClassRow } from "@halaqa/shared";
 import { JobError } from "./errors.ts";
 import { GEMINI_YT_MODELS, GeminiError, geminiYouTubeWindow, youTubeInfo } from "./gemini.ts";
-import { createLlm, QuotaError } from "./llm.ts";
+import { openAICompatLlm, QuotaError } from "./llm.ts";
 import { finishTranscript } from "./pipeline.ts";
-import { sleep } from "./retry.ts";
 import type { Store, StudyRow } from "./store.ts";
 import { generateStudy } from "./study.ts";
 
@@ -23,18 +23,22 @@ export interface CloudOpts {
 }
 
 const MAX_HOURS = 12;
-/** Waits inside one run between tries; the model alternates each try (3.8 Flash ↔ 3.5 Flash). */
-const TRY_WAIT_S = [20, 60, 120];
-/** If a run still can't get through, the job waits this long (minutes) before the next run. */
-const LATER_MIN = [2, 5, 15, 30, 60];
+/** After a run can't get through, the job waits this long (minutes). The scheduler checks every 10 minutes. */
+const LATER_MIN = [10, 10, 20, 30, 60];
 const GIVE_UP_AFTER = 30; // ≈ a day of hourly retries
-const SAFETY_MS = 4 * 60_000; // one window + retries must fit before the 15-minute limit
+/** Never start a Gemini call that could outlive the run (a 20-minute window takes ~1-2 min; cap 6). */
+const MIN_CALL_MS = 3 * 60_000;
+const MAX_CALL_MS = 6 * 60_000;
+/** Study notes: give up only after ~4 days of "quota used up" (hourly retries); other errors after a few tries. */
+const STUDY_QUOTA_TRIES = 100;
+const STUDY_OTHER_TRIES = 5;
 
 const nowIso = () => new Date().toISOString();
+const left = (o: CloudOpts) => o.deadline - Date.now();
 
 /** Process cloud jobs until there are none or time runs out. "more" = call again to continue. */
 export async function runCloud(o: CloudOpts): Promise<"idle" | "more"> {
-  while (Date.now() < o.deadline - SAFETY_MS) {
+  while (left(o) > MIN_CALL_MS) {
     const row = await o.store.claimClass(o.workerId);
     if (row) {
       if ((await cloudClass(row, o)) === "more") return "more";
@@ -50,6 +54,16 @@ export async function runCloud(o: CloudOpts): Promise<"idle" | "more"> {
   return "more";
 }
 
+/** Plan contiguous windows over [0, end); a tail under 2 minutes joins the previous window. Exported for tests. */
+export function planWindows(end: number, W: number) {
+  const plan: Array<{ idx: number; start: number; end: number }> = [];
+  for (let s = 0, i = 0; s < end; s += W, i++) plan.push({ idx: i, start: s, end: Math.min(end, s + W) });
+  if (plan.length > 1 && plan[plan.length - 1].end - plan[plan.length - 1].start < 120) plan[plan.length - 2].end = plan.pop()!.end;
+  return plan;
+}
+
+class OutOfTime extends Error {}
+
 async function cloudClass(row: ClassRow, o: CloudOpts): Promise<"done" | "more"> {
   const { store } = o;
   const log = (m: string) => o.log(`class ${row.id}: ${m}`);
@@ -64,6 +78,8 @@ async function cloudClass(row: ClassRow, o: CloudOpts): Promise<"done" | "more">
     return "done" as const;
   };
 
+  let total = 0;
+  let done = 0;
   try {
     let chunks = await store.listChunks(row.id);
     if (!chunks.length) {
@@ -77,49 +93,68 @@ async function cloudClass(row: ClassRow, o: CloudOpts): Promise<"done" | "more">
         thumbnail_url: info.thumbnail,
         duration_seconds: info.duration,
       });
-      const W = o.windowSeconds;
-      // Gemini returns an EMPTY answer if the clip ends at/after the video's real end (YouTube rounds the
-      // listed length up), so the last window stops 3 s early — measured on the 1-hour test lecture.
-      const usable = Math.max(1, info.duration - 3);
-      const plan = [];
-      for (let s = 0, i = 0; s < usable; s += W, i++) plan.push({ idx: i, start: s, end: Math.min(usable, s + W) });
-      // Fold a tiny tail (< 2 min) into the previous window.
-      if (plan.length > 1 && plan[plan.length - 1].end - plan[plan.length - 1].start < 120) plan[plan.length - 2].end = plan.pop()!.end;
-      await store.createChunks(row.id, plan);
+      // End exactly at the video's real end (measured: up to 3642.3 of 3642.57 s works and keeps the closing dua).
+      // Without the precise length, start 1 s inside the rounded-up listed length; an empty last answer steps back.
+      const end = info.exactEnd && info.exactEnd <= info.duration + 1 ? info.exactEnd - 0.25 : info.duration - 1;
+      await store.createChunks(row.id, planWindows(Math.max(1, end), o.windowSeconds));
       chunks = await store.listChunks(row.id);
     }
 
-    const total = chunks.length;
-    let done = chunks.filter((c) => c.done).length;
-    for (const c of chunks) {
-      if (c.done) continue;
-      if (Date.now() > o.deadline - SAFETY_MS) {
-        await release({ status_message: `Transcribing… ${done} of ${total} parts done.` });
-        return "more";
+    total = chunks.length;
+    done = chunks.filter((c) => c.done).length;
+    const lastIdx = chunks[chunks.length - 1].idx;
+    // Experimental max 2. A lecture that Google pushed back on last time restarts one window at a time.
+    let concurrency = failures ? 1 : Math.min(2, Math.max(1, Number(process.env.CLOUD_CONCURRENCY) || 2));
+    let pending = chunks.filter((c) => !c.done);
+    while (pending.length) {
+      if (left(o) < MIN_CALL_MS) throw new OutOfTime();
+      const batch = pending.slice(0, concurrency);
+      await report(
+        "transcribing",
+        0.05 + (0.9 * done) / total,
+        total > 1 ? `Transcribing part${batch.length > 1 ? "s" : ""} ${done + 1}${batch.length > 1 ? `–${done + batch.length}` : ""} of ${total}…` : "Transcribing…",
+      );
+      const results = await Promise.allSettled(
+        batch.map(async (c) => ({ c, ...(await transcribeWindow(row, c.start_s, c.end_s, c.idx === lastIdx, o, log)) })),
+      );
+      let firstError: unknown;
+      let sawBusy = false;
+      for (const r of results) {
+        if (r.status === "rejected") {
+          firstError ??= r.reason;
+          if (r.reason instanceof GeminiError && r.reason.retryable) sawBusy = true;
+          continue;
+        }
+        const { c, segments, model } = r.value;
+        await store.saveChunk(row.id, c.idx, segments, `gemini:${model}`, o.workerId);
+        c.segments = segments;
+        c.provider = `gemini:${model}`;
+        c.done = true;
+        done++;
+        if (failures) await store.updateClass(row.id, { cloud_failures: 0 });
       }
-      await report("transcribing", 0.05 + (0.9 * done) / total, total > 1 ? `Transcribing part ${done + 1} of ${total}…` : "Transcribing…");
-      const { segments, model } = await windowWithRetries(row, c.start_s, c.end_s, o, log);
-      await store.saveChunk(row.id, c.idx, segments, `gemini:${model}`);
-      c.segments = segments;
-      c.provider = `gemini:${model}`;
-      c.done = true;
-      done++;
-      if (failures) await store.updateClass(row.id, { cloud_failures: 0 });
+      // Capacity pushed back on at least one window this run: stop asking for more than one at a time.
+      if (sawBusy) concurrency = 1;
+      if (firstError) throw firstError; // saved windows above stay done; the run backs off and resumes later
+      pending = pending.slice(batch.length);
     }
 
     const raw = chunks.flatMap((c) => c.segments ?? []);
     const provider = [...new Set(chunks.map((c) => c.provider).filter(Boolean))].join(",") || "gemini";
     // Gemini's text already has punctuation and Arabic script, so no extra AI polish pass.
-    await finishTranscript(row, raw, "ai", provider, {
-      store,
-      refiner: null,
-      refineConcurrency: 1,
-      log,
-      report: (s, p, m) => report(s, p, m),
-    });
+    await finishTranscript(row, raw, "ai", provider, { store, refiner: null, refineConcurrency: 1, log, report: (s, p, m) => report(s, p, m) });
     log("completed");
     return "done";
   } catch (e) {
+    if (/no longer assigned/.test((e as Error).message)) {
+      log("another run took over this lecture; leaving it alone");
+      return "done";
+    }
+    if (e instanceof OutOfTime) {
+      // Not a failure: this run's 15 minutes are nearly up. The next run continues right away.
+      await release({ status_message: `Transcribing… ${done} of ${total} parts done.` });
+      return "more";
+    }
     if (e instanceof GeminiError && !e.retryable) return toHomeComputer("The online service couldn't read this video.");
     if (e instanceof JobError && e.permanent) {
       log(`${e.code} ${e.message}`);
@@ -146,64 +181,96 @@ async function cloudClass(row: ClassRow, o: CloudOpts): Promise<"done" | "more">
       next_attempt_at: new Date(Date.now() + mins * 60_000).toISOString(),
       status_message: perDay
         ? "Today's free transcription allowance is used up. It will continue automatically (checking every hour) — nothing to do."
-        : `Google's free service is busy. Finished parts are saved; it will continue automatically in ${mins} minute${mins > 1 ? "s" : ""}.`,
+        : `Google's free service is busy. ${done ? `${done} of ${total} parts are saved; it` : "It"} will continue automatically in about ${mins} minutes.`,
     });
     return "done";
   }
 }
 
-/** One window: alternate models, bounded exponential waits, keep the job's lock fresh while waiting. */
-async function windowWithRetries(row: ClassRow, start: number, end: number, o: CloudOpts, log: (m: string) => void) {
-  const models = GEMINI_YT_MODELS;
-  for (let i = 0; ; i++) {
-    const model = models[i % models.length];
+/**
+ * One window: one try per model, back to back (3.8 Flash, then 3.5 Flash). No sleeping — if both are busy the
+ * caller schedules a later run. The job's lock is refreshed before every call, and every call ends well before
+ * the lock could go stale (10 min) or the run is stopped (15 min). For the LAST window only, an empty answer
+ * means the clip ran past the real end: step back 1 s (≤ 3 times) instead of dropping seconds up front.
+ */
+async function transcribeWindow(row: ClassRow, start: number, end: number, last: boolean, o: CloudOpts, log: (m: string) => void) {
+  let lastErr: unknown;
+  let e2 = end;
+  let stepsBack = 0;
+  /**
+   * Gemini sometimes stops early while reporting a normal finish (measured: a 20-min window came back covering only
+   * 4 minutes). A window whose lines stop before 75% of it is "short": ask the other model too. Two short answers
+   * from different models are taken as real (e.g. a break in the class) and the longer is kept; a single short answer
+   * is never saved — the window is retried later instead.
+   */
+  let short = null as { segments: Awaited<ReturnType<typeof geminiYouTubeWindow>>; model: string; words: number } | null;
+  const isShort = (segs: Array<{ start: number }>) => !last && e2 - start >= 300 && (segs.at(-1)?.start ?? start) < start + 0.75 * (e2 - start);
+  const wordCount = (segs: Array<{ text: string }>) => segs.reduce((n, s) => n + s.text.split(/\s+/).filter(Boolean).length, 0);
+  for (let i = 0; i < GEMINI_YT_MODELS.length + 3; i++) {
+    const model = GEMINI_YT_MODELS[i % GEMINI_YT_MODELS.length];
+    if (left(o) < MIN_CALL_MS) throw new OutOfTime();
+    await o.store.updateClass(row.id, { locked_at: nowIso() });
     const t = Date.now();
     try {
-      const segments = await geminiYouTubeWindow(o.apiKey, model, row.youtube_id!, start, end);
-      log(`window ${start}-${end}s: ${model} ${((Date.now() - t) / 1000).toFixed(1)}s, ${segments.length} lines`);
-      return { segments, model };
+      const segments = await geminiYouTubeWindow(o.apiKey, model, row.youtube_id!, start, e2, Math.min(MAX_CALL_MS, left(o) - 60_000));
+      log(`window ${start}-${e2}s: ${model} ${((Date.now() - t) / 1000).toFixed(1)}s, ${segments.length} lines`);
+      if (!isShort(segments)) return { segments, model };
+      const words = wordCount(segments);
+      log(`window ${start}-${e2}s: ${model} answer stops at ${Math.round(segments.at(-1)?.start ?? start)}s — checking with another model`);
+      if (short && short.model !== model) return words > short.words ? { segments, model } : short; // two models agree it's short
+      short = words > (short?.words ?? -1) ? { segments, model, words } : short;
+      lastErr = new GeminiError(`${model}: answer covered only part of the window`, 200, true);
+      if (i + 1 - stepsBack >= GEMINI_YT_MODELS.length) break;
     } catch (e) {
+      lastErr = e;
       const ge = e as GeminiError;
-      const wait = TRY_WAIT_S[i];
-      log(`window ${start}-${end}s: ${ge.message.slice(0, 200)}`);
-      if (!(e instanceof GeminiError) || !ge.retryable || ge.perDay || wait === undefined || Date.now() + wait * 1000 > o.deadline - SAFETY_MS / 2) throw e;
-      await o.store.updateClass(row.id, { locked_at: nowIso() });
-      await sleep(wait * 1000 * (0.8 + Math.random() * 0.4));
+      log(`window ${start}-${e2}s: ${ge.message.slice(0, 200)}`);
+      if (!(e instanceof GeminiError) || !ge.retryable || ge.perDay) throw e;
+      if (last && ge.empty && stepsBack < 3) {
+        e2 -= 1;
+        stepsBack++;
+        continue;
+      }
+      if (i + 1 - stepsBack >= GEMINI_YT_MODELS.length) break; // every model tried once
     }
   }
+  throw lastErr;
 }
 
-/** Study notes in the cloud too (same code as the home worker), so they work with the PC off. */
+/** Study notes run on their own: a finished transcript is never touched; quota/busy just means "waiting". */
 async function cloudStudy(row: StudyRow, o: CloudOpts) {
   const { store } = o;
-  const llm = createLlm({
-    llmProvider: "gemini",
-    geminiApiKey: o.apiKey,
-    geminiModel: process.env.GEMINI_MODEL || "gemini-flash-latest",
-    anthropicApiKey: "",
-    claudeModel: "",
-    refineEffort: "low",
-    groqApiKey: "",
-    groqLlmModel: "",
-    githubModelsToken: "",
-    githubModelsModel: "",
-  })!;
+  const llm = openAICompatLlm({
+    name: "gemini",
+    baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+    apiKey: o.apiKey,
+    model: process.env.GEMINI_MODEL || "gemini-flash-latest",
+    maxInputTokens: 120_000,
+    maxOutputTokens: 8_000,
+    extraBody: { reasoning_effort: "none" },
+    maxWaitMs: 30_000, // don't pay for long sleeps: record the next try instead
+  });
   try {
     const [cls, doc] = await Promise.all([store.getClass(row.class_id), store.getTranscript(row.class_id)]);
     if (!cls || !doc) throw new Error("The transcript isn't ready yet.");
     if (cls.ai_opt_out) throw Object.assign(new Error("This lecture is marked private, so study notes (which use an online AI service) are turned off for it."), { permanent: true });
     const { content, data } = await generateStudy(llm, row.kind, cls.title ?? "Class", cls.id, doc, cls.speaker_names ?? {});
-    await store.updateStudy(row.id, { status: "completed", content, data, error: null, locked_by: null, locked_at: null });
+    await store.updateStudy(row.id, { status: "completed", content, data, error: null, status_message: null, locked_by: null, locked_at: null });
   } catch (e) {
-    const quota = e instanceof QuotaError;
+    const msg = (e as Error).message;
+    const waiting = e instanceof QuotaError || /\b(429|500|502|503|504)\b|high demand|overloaded|network/i.test(msg);
     const permanent = !!(e as { permanent?: boolean }).permanent;
-    const retry = !permanent && row.attempts < (quota ? 10 : 3);
-    o.log(`study ${row.id}: failed (${(e as Error).message.slice(0, 200)})`);
+    const retry = !permanent && row.attempts < (waiting ? STUDY_QUOTA_TRIES : STUDY_OTHER_TRIES);
+    o.log(`study ${row.id}: failed (${msg.slice(0, 200)})`);
     await store.updateStudy(row.id, {
       status: retry ? "queued" : "failed",
-      error: retry ? null : (e as Error).message.slice(0, 500),
-      status_message: retry ? (quota ? "The free AI quota is used up for now. It will try again automatically." : (e as Error).message.slice(0, 300)) : null,
-      next_attempt_at: new Date(Date.now() + (quota ? 60 : 2) * 60_000).toISOString(),
+      error: retry ? null : msg.slice(0, 500),
+      status_message: retry
+        ? waiting
+          ? "Waiting to generate — Google's free AI allowance is used up or busy right now. It will try again automatically; the transcript is ready to read."
+          : "Waiting to generate — it will try again in a few minutes."
+        : null,
+      next_attempt_at: new Date(Date.now() + (e instanceof QuotaError ? 60 : 10) * 60_000).toISOString(),
       locked_by: null,
       locked_at: null,
     });
