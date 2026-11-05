@@ -9,6 +9,7 @@ import { JobError } from "./errors.ts";
 import { GEMINI_YT_MODELS, GeminiError, geminiYouTubeWindow, youTubeInfo } from "./gemini.ts";
 import { openAICompatLlm, QuotaError } from "./llm.ts";
 import { finishTranscript } from "./pipeline.ts";
+import type { RawSegment } from "./segmenting.ts";
 import type { Store, StudyRow } from "./store.ts";
 import { generateStudy } from "./study.ts";
 
@@ -36,12 +37,28 @@ const STUDY_OTHER_TRIES = 5;
 const nowIso = () => new Date().toISOString();
 const left = (o: CloudOpts) => o.deadline - Date.now();
 
+/** Every class write from this run names its owner, so a stale run cannot clear a newer lock. */
+function owned(o: CloudOpts): CloudOpts {
+  const store = new Proxy(o.store, {
+    get(target, prop) {
+      if (prop === "updateClass") {
+        return (id: string, patch: Record<string, unknown>) => target.updateClass(id, { ...patch, owner: o.workerId });
+      }
+      const value = Reflect.get(target, prop, target);
+      return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+    },
+  });
+  return { ...o, store };
+}
+
 /** Process cloud jobs until there are none or time runs out. "more" = call again to continue. */
+
 export async function runCloud(o: CloudOpts): Promise<"idle" | "more"> {
+  const ownedOpts = owned(o);
   while (left(o) > MIN_CALL_MS) {
-    const row = await o.store.claimClass(o.workerId);
+    const row = await ownedOpts.store.claimClass(o.workerId);
     if (row) {
-      if ((await cloudClass(row, o)) === "more") return "more";
+      if ((await cloudClass(row, ownedOpts)) === "more") return "more";
       continue;
     }
     const study = await o.store.claimStudy(o.workerId);
@@ -167,7 +184,7 @@ async function cloudClass(row: ClassRow, o: CloudOpts): Promise<"done" | "more">
     if (n >= GIVE_UP_AFTER) {
       await store.updateClass(row.id, {
         status: "failed",
-        error: "Google's free transcription service kept refusing for about a day. Press “Try again” to restart.",
+        error: "This lecture could not be finished after many tries. Press “Try again” to restart.",
         error_code: "CLOUD_BUSY",
         status_message: null,
         locked_by: null,
@@ -180,8 +197,8 @@ async function cloudClass(row: ClassRow, o: CloudOpts): Promise<"done" | "more">
       cloud_failures: n,
       next_attempt_at: new Date(Date.now() + mins * 60_000).toISOString(),
       status_message: perDay
-        ? "Today's free transcription allowance is used up. It will continue automatically (checking every hour) — nothing to do."
-        : `Google's free service is busy. ${done ? `${done} of ${total} parts are saved; it` : "It"} will continue automatically in about ${mins} minutes.`,
+        ? "Today's transcription limit is reached. It will continue on its own — nothing for you to do."
+        : `${done ? `${done} of ${total} parts are saved. ` : ""}It will continue on its own in about ${mins} minutes.`,
     });
     return "done";
   }
@@ -192,19 +209,22 @@ async function cloudClass(row: ClassRow, o: CloudOpts): Promise<"done" | "more">
  * caller schedules a later run. The job's lock is refreshed before every call, and every call ends well before
  * the lock could go stale (10 min) or the run is stopped (15 min). For the LAST window only, an empty answer
  * means the clip ran past the real end: step back 1 s (≤ 3 times) instead of dropping seconds up front.
+ * A last window that has speech but stops early is still rejected — a 6-hour lecture's final part is a full window.
+ * Two models stopping at the same minute is not treated as silence: the uncovered tail is retried as a smaller clip.
  */
-async function transcribeWindow(row: ClassRow, start: number, end: number, last: boolean, o: CloudOpts, log: (m: string) => void) {
+async function transcribeWindow(row: ClassRow, start: number, end: number, last: boolean, o: CloudOpts, log: (m: string) => void, depth = 0): Promise<{ segments: RawSegment[]; model: string }> {
   let lastErr: unknown;
   let e2 = end;
   let stepsBack = 0;
   /**
    * Gemini sometimes stops early while reporting a normal finish (measured: a 20-min window came back covering only
    * 4 minutes). A window whose lines stop before 75% of it is "short": ask the other model too. Two short answers
-   * from different models are taken as real (e.g. a break in the class) and the longer is kept; a single short answer
-   * is never saved — the window is retried later instead.
+   * from different models is not proof of silence (both can truncate the same way). The longer prefix is kept and the
+   * tail is transcribed again as a smaller clip. A single short answer is never saved — the window is retried later.
+   * This includes the last window. After two smaller retries, any still-missing span is marked [unclear].
    */
   let short = null as { segments: Awaited<ReturnType<typeof geminiYouTubeWindow>>; model: string; words: number } | null;
-  const isShort = (segs: Array<{ start: number }>) => !last && e2 - start >= 300 && (segs.at(-1)?.start ?? start) < start + 0.75 * (e2 - start);
+  const isShort = (segs: Array<{ start: number }>) => e2 - start >= 300 && (segs.at(-1)?.start ?? start) < start + 0.75 * (e2 - start);
   const wordCount = (segs: Array<{ text: string }>) => segs.reduce((n, s) => n + s.text.split(/\s+/).filter(Boolean).length, 0);
   for (let i = 0; i < GEMINI_YT_MODELS.length + 3; i++) {
     const model = GEMINI_YT_MODELS[i % GEMINI_YT_MODELS.length];
@@ -217,7 +237,24 @@ async function transcribeWindow(row: ClassRow, start: number, end: number, last:
       if (!isShort(segments)) return { segments, model };
       const words = wordCount(segments);
       log(`window ${start}-${e2}s: ${model} answer stops at ${Math.round(segments.at(-1)?.start ?? start)}s — checking with another model`);
-      if (short && short.model !== model) return words > short.words ? { segments, model } : short; // two models agree it's short
+      if (short && short.model !== model) {
+        const best = words > short.words ? { segments, model, words } : short;
+        const covered = best.segments.at(-1)?.start ?? start;
+        if (depth < 2 && e2 - covered >= 120 && left(o) >= MIN_CALL_MS) {
+          log(`window ${start}-${e2}s: both models stop near ${Math.round(covered)}s — retrying the remaining ${Math.round(e2 - covered)}s`);
+          const tail = await transcribeWindow(row, covered, e2, last, o, log, depth + 1);
+          // Keep the prefix, including the line that starts where coverage stopped. Drop only a repeated boundary line.
+          return { segments: [...best.segments, ...tail.segments.filter((s) => s.start > covered)], model: `${best.model}+${tail.model}` };
+        }
+        log(`window ${start}-${e2}s: still uncovered after a smaller retry — marking the gap`);
+        return {
+          segments: [
+            ...best.segments,
+            { start: covered, end: e2, text: "[unclear — this part of the lecture was not fully captured]", speaker: "S1" },
+          ],
+          model: best.model,
+        };
+      }
       short = words > (short?.words ?? -1) ? { segments, model, words } : short;
       lastErr = new GeminiError(`${model}: answer covered only part of the window`, 200, true);
       if (i + 1 - stepsBack >= GEMINI_YT_MODELS.length) break;
@@ -267,7 +304,7 @@ async function cloudStudy(row: StudyRow, o: CloudOpts) {
       error: retry ? null : msg.slice(0, 500),
       status_message: retry
         ? waiting
-          ? "Waiting to generate — Google's free AI allowance is used up or busy right now. It will try again automatically; the transcript is ready to read."
+          ? "Waiting to generate. The transcript is ready to read; notes will be added on their own."
           : "Waiting to generate — it will try again in a few minutes."
         : null,
       next_attempt_at: new Date(Date.now() + (e instanceof QuotaError ? 60 : 10) * 60_000).toISOString(),

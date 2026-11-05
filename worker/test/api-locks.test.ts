@@ -134,6 +134,46 @@ describe("lecture parts (each window stored on its own)", () => {
     expect(rows.flatMap((r) => r.segments ?? []).map((s) => s.text)).toEqual(["old 0", "old 1", "new 2"]);
   });
 
+  it("the early preview reads finished windows from their own blobs", async () => {
+    process.env.APP_PASSWORD = "mom";
+    process.env.SESSION_SECRET = "test-session";
+    data.set("chunks/c3", plan);
+    data.set("part/c3/0", { start_s: 0, end_s: 1200, segments: seg(0, "opened بسم الله"), provider: "gemini" });
+    const login = await handler(new Request("http://site/api/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ password: "mom" }) }));
+    const { token } = (await login.json()) as { token: string };
+    const res = await handler(new Request("http://site/api/classes/c3/partial", { headers: { authorization: `Bearer ${token}` } }));
+    const body = (await res.json()) as { partsDone: number; partsTotal: number; segments: Array<{ text: string }> };
+    expect(body.partsDone).toBe(1);
+    expect(body.partsTotal).toBe(4);
+    expect(body.segments.map((s) => s.text)).toEqual(["opened بسم الله"]);
+  });
+
+  it("search matches Arabic titles and transcripts after removing vowel marks", async () => {
+    process.env.APP_PASSWORD = "mom";
+    process.env.SESSION_SECRET = "test-session";
+    data.set("class/c-search", { id: "c-search", title: "شرح الإيمان", status: "completed" });
+    data.set("search/c-search", { class_id: "c-search", search_text: "ان الله غفور رحيم" });
+    const login = await handler(new Request("http://site/api/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ password: "mom" }) }));
+    const { token } = (await login.json()) as { token: string };
+    const byTitle = await handler(new Request(`http://site/api/search?q=${encodeURIComponent("إيمان")}`, { headers: { authorization: `Bearer ${token}` } }));
+    const titleHits = (await byTitle.json()) as Array<{ class_id: string }>;
+    expect(titleHits.map((h) => h.class_id)).toContain("c-search");
+    const byText = await handler(new Request(`http://site/api/search?q=${encodeURIComponent("اللَّه")}`, { headers: { authorization: `Bearer ${token}` } }));
+    const textHits = (await byText.json()) as Array<{ class_id: string; snippet: string | null }>;
+    expect(textHits.find((h) => h.class_id === "c-search")?.snippet).toContain("الله");
+  });
+
+  it("a stale run cannot release or overwrite a newer owner's fresh lock", async () => {
+    data.set("class/c1", { id: "c1", status: "processing", locked_by: "cloud-new", locked_at: new Date().toISOString() });
+    const stale = await worker("PATCH", "/classes/c1", { owner: "cloud-old", status: "queued", locked_by: null, locked_at: null });
+    expect(stale.status).toBe(409);
+    expect((data.get("class/c1") as { locked_by: string }).locked_by).toBe("cloud-new");
+    const current = await worker("PATCH", "/classes/c1", { owner: "cloud-new", status_message: "Transcribing…" });
+    expect(current.status).toBe(200);
+    expect((data.get("class/c1") as { status_message: string }).status_message).toBe("Transcribing…");
+    expect((data.get("class/c1") as { owner?: string }).owner).toBeUndefined();
+  });
+
   it("a run that no longer holds the lecture can't save", async () => {
     data.set("class/c1", { id: "c1", locked_by: "cloud-new" });
     const r = await worker("PUT", "/classes/c1/chunks/2", { segments: seg(2, "stale"), provider: "gemini", owner: "cloud-a" });

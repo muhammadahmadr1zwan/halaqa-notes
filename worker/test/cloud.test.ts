@@ -140,6 +140,24 @@ describe("cloud runner", () => {
     expect(store.chunks[1].provider).toBe("gemini:gemini-3.5-flash");
   });
 
+  it("the last window is not exempt: one early stop is retried, and a complete re-check is kept", async () => {
+    fakeNet((_n, _e, start, model) => {
+      if (start !== "2400s") return ok(words(60));
+      return model === "gemini-3.8-flash" ? early() : ok(words(60) + "\n[19:00] closing dua وصلى الله على نبينا محمد");
+    });
+    const store = new MemStore(cls());
+    await runCloud(opts(store));
+    expect(store.cls.status).toBe("completed");
+    expect(store.chunks[2].provider).toBe("gemini:gemini-3.5-flash");
+    expect(store.transcript!.doc.segments.at(-1)!.text).toContain("وصلى الله على نبينا محمد");
+
+    fakeNet((_n, _e, start, model) => (start !== "2400s" ? ok(words(60)) : model === "gemini-3.8-flash" ? early() : busy()));
+    const again = new MemStore(cls());
+    await runCloud(opts(again));
+    expect(again.chunks.find((c) => c.idx === 2)!.done).toBe(false);
+    expect(again.cls).toMatchObject({ status: "queued", cloud_failures: 1 });
+  });
+
   it("one early-stopping answer is never saved as done: the window is retried later", async () => {
     fakeNet((_n, _e, start, model) => (start !== "1200s" ? ok(words(60)) : model === "gemini-3.8-flash" ? early() : busy()));
     const store = new MemStore(cls());
@@ -148,11 +166,27 @@ describe("cloud runner", () => {
     expect(store.cls).toMatchObject({ status: "queued", cloud_failures: 1 });
   });
 
-  it("when both models stop at the same point it's treated as real (e.g. a break) and the lecture still finishes", async () => {
-    fakeNet((_n, _e, start) => (start === "1200s" ? early() : ok(words(60))));
+  it("two models stopping early is not treated as silence: the rest of that window is retried smaller", async () => {
+    const calls = fakeNet((_n, _e, start) => (start === "1200s" ? early() : ok(words(60))));
     const store = new MemStore(cls());
     await runCloud(opts(store));
     expect(store.cls.status).toBe("completed");
+    const text = (store.chunks[1].segments ?? []).map((s) => s.text).join(" ");
+    expect(text).toContain("then it just stops");
+    expect(text).toContain("and the lesson continues");
+    expect(calls.filter((c) => c === "2400s").length).toBeGreaterThan(2);
+  });
+
+  it("a tail that is still short after smaller retries is flagged instead of saved as silence", async () => {
+    fakeNet((_n, _e, start) => {
+      const at = Number(String(start).replace("s", ""));
+      return at >= 1200 && at < 2400 ? early() : ok(words(60));
+    });
+    const store = new MemStore(cls());
+    await runCloud(opts(store));
+    expect(store.cls.status).toBe("completed");
+    const text = (store.chunks[1].segments ?? []).map((s) => s.text).join(" ");
+    expect(text).toContain("[unclear — this part of the lecture was not fully captured]");
   });
 
   it("a run that lost its lock stops without touching the lecture", async () => {
@@ -171,7 +205,8 @@ describe("cloud runner", () => {
     store.transcript = { class_id: "c1", doc: { segments: [{ id: 0, start: 0, end: 5, text: "In the name of Allah", speaker: "S1" }], sections: [] } } as unknown as TranscriptRecord;
     await runCloud(opts(store));
     expect(store.study).toMatchObject({ status: "queued", error: null });
-    expect(String(store.study.status_message)).toMatch(/^Waiting to generate .*allowance/);
+    expect(String(store.study.status_message)).toMatch(/^Waiting to generate/);
+    expect(String(store.study.status_message)).toMatch(/transcript is ready/);
     expect(Date.parse(String(store.study.next_attempt_at)) - Date.now()).toBeGreaterThan(50 * 60_000);
     expect(store.transcript!.doc.segments).toHaveLength(1);
   });

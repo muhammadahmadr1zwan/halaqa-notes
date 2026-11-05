@@ -85,7 +85,9 @@ export function StatusPanel({ cls, onRetried, workerOnline }: { cls: ClassRow; o
         })}
       </ol>
       <p className="mt-6 rounded-xl bg-gold-soft px-4 py-3 text-base">
-        You can close this page. Long classes take a while: on the free setup, transcription runs at roughly 2–3× the speed of the recording, so a 6-hour class takes about 2–3 hours. It will be waiting in your library when it's done.
+        {cloud
+          ? "You can close this page and come back later. What is already transcribed is saved, and the lecture will be in your library when it is ready. A very long one may continue the next day."
+          : "You can close this page. Long classes take a while: transcription runs at roughly 2–3× the speed of the recording, so a 6-hour class takes about 2–3 hours. It will be waiting in your library when it's done."}
       </p>
     </Card>
   );

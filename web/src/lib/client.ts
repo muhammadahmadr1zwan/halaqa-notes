@@ -43,7 +43,12 @@ export async function api<T>(path: string, init: RequestInit & { json?: unknown 
     headers.set("content-type", "application/json");
     body = JSON.stringify(init.json);
   }
-  const res = await fetch(`/api${path}`, { ...init, headers, body });
+  let res: Response;
+  try {
+    res = await fetch(`/api${path}`, { ...init, headers, body });
+  } catch {
+    throw new ApiError("No connection. Check the internet and try again.", 0);
+  }
   if (res.status === 401 && path !== "/login") setToken(null);
   const text = await res.text();
   const data = text ? (() => { try { return JSON.parse(text); } catch { return text; } })() : null;

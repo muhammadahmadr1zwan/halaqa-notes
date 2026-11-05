@@ -6,6 +6,7 @@
  *  - /api/worker/…                  the transcription worker (x-worker-secret)
  */
 import { getStore } from "@netlify/blobs";
+import { normalizeForSearch } from "@halaqa/shared/src/arabic.ts";
 import type { ClassRow, StudyKind } from "@halaqa/shared";
 
 export const config = { path: "/api/*" };
@@ -241,7 +242,7 @@ route("GET", "/status", "user", async (_req, _m, s) => {
 
 /** Transcript so far (unpolished) while a long lecture is still processing. */
 route("GET", "/classes/:id/partial", "user", async (_req, [id], s) => {
-  const chunks = (await getJSON<Array<{ idx: number; done: boolean; segments: Array<{ start: number; end: number; text: string; speaker: string }> | null }>>(s, `chunks/${id}`)) ?? [];
+  const chunks = await assembledChunks(s, id);
   const done = chunks.filter((c) => c.done && c.segments);
   return json({ partsDone: done.length, partsTotal: chunks.length, segments: done.sort((a, b) => a.idx - b.idx).flatMap((c) => c.segments!) });
 });
@@ -321,7 +322,7 @@ route("POST", "/classes/:id/study", "user", async (req, [id], s) => {
 });
 
 route("GET", "/search", "user", async (req, _m, s) => {
-  const q = new URL(req.url).searchParams.get("q")?.trim() ?? "";
+  const q = normalizeForSearch(new URL(req.url).searchParams.get("q") ?? "").trim();
   if (q.length < 2) return json([]);
   const [classes, texts] = await Promise.all([listJSON<ClassRow>(s, "class/"), listJSON<{ class_id: string; search_text: string }>(s, "search/")]);
   const byId = new Map(texts.map((t) => [t.class_id, t.search_text]));
@@ -330,7 +331,7 @@ route("GET", "/search", "user", async (req, _m, s) => {
     const text = byId.get(c.id) ?? "";
     const at = text.indexOf(q);
     if (at >= 0) out.push({ class_id: c.id, snippet: `…${text.slice(Math.max(0, at - 60), at + 120)}…` });
-    else if ((c.title ?? "").toLowerCase().includes(q)) out.push({ class_id: c.id, snippet: null });
+    else if (normalizeForSearch(c.title ?? "").includes(q)) out.push({ class_id: c.id, snippet: null });
   }
   return json(out);
 });
@@ -475,28 +476,32 @@ route("GET", "/worker/classes/:id", "worker", async (_req, [id], s) => {
 });
 
 route("PATCH", "/worker/classes/:id", "worker", async (req, [id], s) => {
-  const row = await getJSON<ClassRow>(s, `class/${id}`);
+  const row = await getJSON<ClassRow & { locked_by?: string | null; locked_at?: string | null }>(s, `class/${id}`);
   if (!row) return fail(404, "Not found"); // deleted while processing
-  await putClass(s, { ...row, ...((await req.json()) as Partial<ClassRow>), id });
+  const { owner, ...patch } = (await req.json()) as Partial<ClassRow> & { owner?: string };
+  // A cloud run names itself. Once a newer run holds a fresh lock, the old run cannot release or overwrite it.
+  if (owner && row.locked_by && row.locked_by !== owner && row.locked_at && Date.parse(row.locked_at) > Date.now() - STALE_MS) {
+    return fail(409, "This lecture is no longer assigned to this run.");
+  }
+  await putClass(s, { ...row, ...patch, id });
   return json({ ok: true });
 });
 
 /** The window plan lives in `chunks/<id>`; each finished window is its own create-only blob `part/<id>/<idx>`. */
 type ChunkPlanRow = { idx: number; start_s: number; end_s: number; done?: boolean; segments?: unknown; provider?: string | null };
-route("GET", "/worker/classes/:id/chunks", "worker", async (_req, [id], s) => {
+/** Join the plan with saved parts. A part counts only when it was made for this exact window. */
+async function assembledChunks(s: Store, id: string): Promise<ChunkPlanRow[]> {
   const plan = (await getJSON<ChunkPlanRow[]>(s, `chunks/${id}`)) ?? [];
   const { blobs } = await s.list({ prefix: `part/${id}/` });
   const parts = new Map(
     await Promise.all(blobs.map(async (b) => [Number(b.key.split("/").pop()), await getJSON<ChunkPlanRow>(s, b.key)] as const)),
   );
-  return json(
-    plan.map((r) => {
-      const p = parts.get(r.idx);
-      // Only a part made for exactly this window counts (guards against a re-planned lecture).
-      return p && p.start_s === r.start_s && p.end_s === r.end_s ? { ...r, segments: p.segments, provider: p.provider, done: true } : r;
-    }),
-  );
-});
+  return plan.map((r) => {
+    const p = parts.get(r.idx);
+    return p && p.start_s === r.start_s && p.end_s === r.end_s ? { ...r, segments: p.segments, provider: p.provider, done: true } : r;
+  });
+}
+route("GET", "/worker/classes/:id/chunks", "worker", async (_req, [id], s) => json(await assembledChunks(s, id)));
 route("PUT", "/worker/classes/:id/chunks", "worker", async (req, [id], s) => {
   await s.setJSON(`chunks/${id}`, await req.json());
   return json({ ok: true });
