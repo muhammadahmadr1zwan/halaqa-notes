@@ -67,7 +67,7 @@ export async function addYouTubeClass(youtubeId: string, aiOptOut = false): Prom
 
 /** Is the home computer that does the transcribing switched on? */
 export function useWorkerStatus() {
-  return useQuery({ queryKey: ["status"], queryFn: () => api<{ workerOnline: boolean; lastSeen: string | null }>("/status"), refetchInterval: 30_000 });
+  return useQuery({ queryKey: ["status"], queryFn: () => api<{ workerOnline: boolean; lastSeen: string | null; cloudEnabled?: boolean }>("/status"), refetchInterval: 30_000 });
 }
 
 export interface PartialTranscript {

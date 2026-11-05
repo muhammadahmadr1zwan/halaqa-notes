@@ -51,6 +51,7 @@ export class HttpStore implements Store {
   constructor(
     private baseUrl: string,
     private secret: string,
+    private extraHeaders: Record<string, string> = {},
   ) {}
 
   private async call<T>(method: string, path: string, body?: unknown): Promise<T> {
@@ -59,7 +60,7 @@ export class HttpStore implements Store {
       try {
         const res = await fetch(`${this.baseUrl}/api/worker${path}`, {
           method,
-          headers: { "x-worker-secret": this.secret, ...(body !== undefined ? { "content-type": "application/json" } : {}) },
+          headers: { "x-worker-secret": this.secret, ...this.extraHeaders, ...(body !== undefined ? { "content-type": "application/json" } : {}) },
           body: body !== undefined ? JSON.stringify(body) : undefined,
           signal: AbortSignal.timeout(60_000),
         });
@@ -80,6 +81,10 @@ export class HttpStore implements Store {
     throw lastErr;
   }
 
+  /** Cloud runner only: nothing claimable now; let the site schedule the next run. */
+  cloudIdle() {
+    return this.call<{ next: string | null }>("POST", "/cloud-idle", {});
+  }
   claimClass(workerId: string) {
     return this.call<ClassRow | null>("POST", "/claim-class", { workerId });
   }
@@ -128,7 +133,7 @@ export class HttpStore implements Store {
     for (let i = 0; i < meta.parts; i++) {
       let buf: ArrayBuffer | null = null;
       for (let attempt = 1; !buf; attempt++) {
-        const res = await fetch(`${this.baseUrl}/api/worker/uploads/${uploadId}/parts/${i}`, { headers: { "x-worker-secret": this.secret } });
+        const res = await fetch(`${this.baseUrl}/api/worker/uploads/${uploadId}/parts/${i}`, { headers: { "x-worker-secret": this.secret, ...this.extraHeaders } });
         if (res.ok) buf = await res.arrayBuffer();
         else if (attempt >= 5) throw new Error(`Could not download upload part ${i}: ${res.status}`);
         else await new Promise((r) => setTimeout(r, 2000 * attempt));

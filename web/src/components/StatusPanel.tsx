@@ -47,7 +47,9 @@ export function StatusPanel({ cls, onRetried, workerOnline }: { cls: ClassRow; o
 
   const stepIdx = Math.max(0, STEPS.findIndex((s) => s.key === cls.stage));
   const waiting = cls.status === "queued";
-  const offline = workerOnline === false;
+  const cloud = cls.engine === "cloud";
+  // Cloud lectures don't need the home computer, so never show "switched off" for them.
+  const offline = workerOnline === false && !cloud;
   const headline = offline
     ? waiting
       ? "Your lecture is in the queue"
@@ -58,6 +60,7 @@ export function StatusPanel({ cls, onRetried, workerOnline }: { cls: ClassRow; o
   const detail = offline
     ? "The home computer that prepares transcripts is switched off. Nothing is lost: it will continue automatically when the computer is turned on."
     : cls.status_message || (waiting ? "It will start in a moment." : "Starting…");
+  const closeNote = cloud ? "You can close the app — this keeps going online and will be ready when you come back." : null;
   return (
     <Card className="p-6">
       <div className="flex items-center gap-3">
@@ -66,6 +69,7 @@ export function StatusPanel({ cls, onRetried, workerOnline }: { cls: ClassRow; o
       </div>
       <ProgressBar value={cls.progress} className="mt-5" />
       <p className="mt-3 text-lg">{detail}</p>
+      {closeNote && <p className="mt-2 text-muted">{closeNote}</p>}
       <ol className="mt-6 grid gap-2 sm:grid-cols-4">
         {STEPS.map((s, i) => {
           const done = !waiting && i < stepIdx;

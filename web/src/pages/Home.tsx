@@ -130,7 +130,8 @@ export function Home() {
 function Library() {
   const classes = useClasses();
   const status = useWorkerStatus();
-  const waitingCount = (classes.data ?? []).filter((c) => c.status === "queued" || c.status === "processing").length;
+  // Only lectures that need the home computer (uploads, private ones) wait for it.
+  const waitingCount = (classes.data ?? []).filter((c) => (c.status === "queued" || c.status === "processing") && c.engine !== "cloud").length;
   const [q, setQ] = useState("");
   const search = useSearch(q);
   const searching = q.trim().length >= 2;

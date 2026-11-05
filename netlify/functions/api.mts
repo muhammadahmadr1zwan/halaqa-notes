@@ -121,7 +121,11 @@ const sameHostRestart = (lockedBy: string | null | undefined, workerId: string) 
 
 const claimable = (workerId: string) => (r: { status: string; next_attempt_at?: string; locked_at?: string | null; locked_by?: string | null }) =>
   (r.status === "queued" && (!r.next_attempt_at || r.next_attempt_at <= now())) ||
-  (r.status === "processing" && (!r.locked_at || Date.parse(r.locked_at) < Date.now() - STALE_MS || sameHostRestart(r.locked_by, workerId)));
+  (r.status === "processing" &&
+    (!r.locked_at || Date.parse(r.locked_at) < Date.now() - STALE_MS || (!isCloudWorker(workerId) && sameHostRestart(r.locked_by, workerId))));
+
+/** Cloud runs take only cloud jobs; the home computer takes everything else (uploads, private, handed-back jobs). */
+const rightEngine = (workerId: string) => (r: CloudFields) => isCloudWorker(workerId) === (r.engine === "cloud");
 
 async function deleteClass(s: Store, c: ClassRow) {
   const keys = [`class/${c.id}`, `transcript/${c.id}`, `search/${c.id}`, `chunks/${c.id}`];
@@ -144,6 +148,24 @@ async function overDailyLimit(s: Store) {
 async function touchWorker(s: Store) {
   const prev = await getJSON<{ last_seen: string }>(s, "meta/worker");
   if (!prev || Date.now() - Date.parse(prev.last_seen) > 30_000) await s.setJSON("meta/worker", { last_seen: now() });
+}
+
+// ───────────────────────── cloud transcription (Gemini) ─────────────────────────
+/** Public YouTube lectures go to the cloud path when a Gemini key is set on the site; private ones never do. */
+const cloudEnabled = () => !!env("GEMINI_API_KEY");
+const isCloudWorker = (workerId: string) => workerId.startsWith("cloud-");
+type CloudFields = { engine?: "cloud" | "local"; cloud_failures?: number };
+
+/** Earliest time the cloud runner has work; a scheduled function reads this one small blob every 10 minutes. */
+const setCloudNext = (s: Store, at: string) => s.setJSON("meta/cloud-next", { at });
+
+/** Start the background function now (returns immediately; it runs up to 15 minutes). */
+async function kickCloud(s: Store) {
+  if (!cloudEnabled()) return;
+  await setCloudNext(s, now()); // safety net if this call is lost: the scheduler picks it up
+  const base = env("URL") || env("DEPLOY_URL");
+  if (!base) return;
+  await fetch(`${base}/.netlify/functions/cloud-background`, { method: "POST", headers: { "x-worker-secret": env("WORKER_SECRET") } }).catch(() => {});
 }
 
 // ───────────────────────── routing ─────────────────────────
@@ -180,15 +202,17 @@ route("POST", "/classes", "user", async (req, _m, s) => {
   const existing = await getJSON<{ id: string }>(s, `yt/${youtube_id}`);
   if (existing && (await getJSON(s, `class/${existing.id}`))) return json({ id: existing.id, existing: true });
   if (await overDailyLimit(s)) return fail(429, `You've added ${DAILY_LIMIT} lectures today. Please add more tomorrow.`);
-  const row = newClass({ source_type: "youtube", youtube_id, source_url: `https://www.youtube.com/watch?v=${youtube_id}`, ...({ ai_opt_out: !!ai_opt_out } as object) });
+  const engine = !ai_opt_out && cloudEnabled() ? "cloud" : "local";
+  const row = newClass({ source_type: "youtube", youtube_id, source_url: `https://www.youtube.com/watch?v=${youtube_id}`, ...({ ai_opt_out: !!ai_opt_out, engine } as object) });
   await putClass(s, row);
   await s.setJSON(`yt/${youtube_id}`, { id: row.id });
+  if (engine === "cloud") await kickCloud(s);
   return json({ id: row.id }, 201);
 });
 
 route("GET", "/status", "user", async (_req, _m, s) => {
   const w = await getJSON<{ last_seen: string }>(s, "meta/worker");
-  return json({ workerOnline: !!w && Date.now() - Date.parse(w.last_seen) < 3 * 60_000, lastSeen: w?.last_seen ?? null });
+  return json({ workerOnline: !!w && Date.now() - Date.parse(w.last_seen) < 3 * 60_000, lastSeen: w?.last_seen ?? null, cloudEnabled: cloudEnabled() });
 });
 
 /** Transcript so far (unpolished) while a long lecture is still processing. */
@@ -211,7 +235,12 @@ route("PATCH", "/classes/:id", "user", async (req, [id], s) => {
   if (typeof body.title === "string") allowed.title = body.title.slice(0, 300);
   if (body.class_date === null || typeof body.class_date === "string") allowed.class_date = body.class_date;
   if (body.speaker_names && typeof body.speaker_names === "object") allowed.speaker_names = body.speaker_names;
-  if (typeof (body as { ai_opt_out?: unknown }).ai_opt_out === "boolean") Object.assign(allowed, { ai_opt_out: (body as { ai_opt_out: boolean }).ai_opt_out });
+  if (typeof (body as { ai_opt_out?: unknown }).ai_opt_out === "boolean") {
+    const optOut = (body as { ai_opt_out: boolean }).ai_opt_out;
+    Object.assign(allowed, { ai_opt_out: optOut });
+    // Marked private before the cloud finished: keep it on the home computer from now on.
+    if (optOut && row.status !== "completed") Object.assign(allowed, { engine: "local" });
+  }
   await putClass(s, { ...row, ...allowed });
   return json({ ok: true });
 });
@@ -226,7 +255,8 @@ route("POST", "/classes/:id/retry", "user", async (_req, [id], s) => {
   const row = await getJSON<ClassRow>(s, `class/${id}`);
   if (!row) return fail(404, "Not found");
   if (row.status !== "failed") return json({ ok: true });
-  await putClass(s, { ...row, status: "queued", stage: "waiting", attempts: 0, error: null, error_code: null, status_message: null, ...({ next_attempt_at: now(), locked_by: null, locked_at: null } as object) });
+  await putClass(s, { ...row, status: "queued", stage: "waiting", attempts: 0, error: null, error_code: null, status_message: null, ...({ next_attempt_at: now(), locked_by: null, locked_at: null, cloud_failures: 0 } as object) });
+  if ((row as CloudFields).engine === "cloud") await kickCloud(s);
   return json({ ok: true });
 });
 
@@ -262,6 +292,7 @@ route("POST", "/classes/:id/study", "user", async (req, [id], s) => {
       updated_at: now(),
     } satisfies StudyRow);
   }
+  if (!row.ai_opt_out) await kickCloud(s);
   return json({ ok: true });
 });
 
@@ -332,13 +363,22 @@ route("POST", "/uploads/:id/complete", "user", async (req, [id], s) => {
 // ───────────────────────── worker endpoints ─────────────────────────
 route("POST", "/worker/claim-class", "worker", async (req, _m, s) => {
   const { workerId } = (await req.json()) as { workerId: string };
-  const rows = (await listJSON<ClassRow & { next_attempt_at?: string; locked_at?: string | null; locked_by?: string | null }>(s, "class/")).filter(claimable(workerId));
+  const rows = (await listJSON<ClassRow & CloudFields & { next_attempt_at?: string; locked_at?: string | null; locked_by?: string | null }>(s, "class/"))
+    .filter(claimable(workerId))
+    .filter(rightEngine(workerId));
   rows.sort((a, b) => a.created_at.localeCompare(b.created_at));
-  const row = rows[0];
-  if (!row) return json(null);
-  const claimed = { ...row, status: "processing" as const, attempts: row.attempts + 1, status_message: row.status_message ?? "Starting…", locked_by: workerId, locked_at: now() };
-  await putClass(s, claimed);
-  return json(claimed);
+  for (const candidate of rows) {
+    // Compare-and-swap: if another run changed the row since we read it, skip it (no double processing).
+    const cur = await s.getWithMetadata(`class/${candidate.id}`, { type: "json" });
+    const row = cur?.data as (typeof rows)[number] | undefined;
+    if (!cur || !row || !claimable(workerId)(row) || !rightEngine(workerId)(row)) continue;
+    const claimed = { ...row, status: "processing" as const, attempts: row.attempts + 1, status_message: row.status_message ?? "Starting…", locked_by: workerId, locked_at: now(), updated_at: now() };
+    const res = await s.setJSON(`class/${row.id}`, claimed, cur.etag ? { onlyIfMatch: cur.etag } : {});
+    if (res && res.modified === false) continue;
+    if (isCloudWorker(workerId)) await setCloudNext(s, new Date(Date.now() + 16 * 60_000).toISOString()); // watchdog if the run dies
+    return json(claimed);
+  }
+  return json(null);
 });
 
 route("POST", "/worker/claim-study", "worker", async (req, _m, s) => {
@@ -349,6 +389,19 @@ route("POST", "/worker/claim-study", "worker", async (req, _m, s) => {
   const claimed = { ...row, status: "processing", attempts: row.attempts + 1, locked_by: workerId, locked_at: now(), updated_at: now() };
   await s.setJSON(`study/${row.class_id}/${row.kind}`, claimed);
   return json(claimed);
+});
+
+/** The cloud runner found nothing to do: remember when the earliest waiting cloud job is due (or clear). */
+route("POST", "/worker/cloud-idle", "worker", async (_req, _m, s) => {
+  const due = [
+    ...(await listJSON<ClassRow & CloudFields & { next_attempt_at?: string }>(s, "class/")).filter((r) => r.engine === "cloud" && r.status !== "completed" && r.status !== "failed"),
+    ...(await listJSON<StudyRow>(s, "study/")).filter((r) => r.status === "queued" || r.status === "processing"),
+  ]
+    .map((r) => (r.status === "processing" ? new Date(Date.now() + 16 * 60_000).toISOString() : (r.next_attempt_at ?? now())))
+    .sort();
+  if (due[0]) await setCloudNext(s, due[0]);
+  else await s.delete("meta/cloud-next");
+  return json({ next: due[0] ?? null });
 });
 
 route("GET", "/worker/classes/:id", "worker", async (_req, [id], s) => {
@@ -427,7 +480,8 @@ export default async (req: Request): Promise<Response> => {
     if (auth === "user" && !(await validToken(req))) return fail(401, "Please sign in again.");
     if (auth === "worker" && (!env("WORKER_SECRET") || !safeEqual(req.headers.get("x-worker-secret") ?? "", env("WORKER_SECRET")))) return fail(401, "Bad worker secret");
     try {
-      if (auth === "worker") await touchWorker(db()).catch(() => {});
+      // Only the home computer counts as "online"; the cloud runner says who it is.
+      if (auth === "worker" && req.headers.get("x-worker-kind") !== "cloud") await touchWorker(db()).catch(() => {});
       return await handler(req, m.slice(1).map(decodeURIComponent), db());
     } catch (e) {
       console.error(e);

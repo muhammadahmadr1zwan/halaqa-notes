@@ -139,6 +139,21 @@ export async function processClass(row: ClassRow, d: PipelineDeps): Promise<void
     raw = chunks.flatMap((c) => c.segments ?? []);
   }
 
+  await finishTranscript(row, raw, source, provider, { store, refiner: d.refiner, refineConcurrency: cfg.refineConcurrency, log, report });
+  await fs.rm(dir, { recursive: true, force: true });
+}
+
+export interface FinishDeps {
+  store: Store;
+  refiner: Refiner | null;
+  refineConcurrency: number;
+  log: (msg: string) => void;
+  report: (stage: string, progress: number, message: string, force?: boolean) => Promise<void>;
+}
+
+/** Steps shared by the home worker and the cloud path: (optional) AI polish, then save and mark completed. */
+export async function finishTranscript(row: ClassRow, raw: RawSegment[], source: TranscriptSource, provider: string, f: FinishDeps): Promise<void> {
+  const { store, log, report } = f;
   if (!raw.some((s) => s.text.trim())) throw new JobError("NO_SPEECH", "We couldn't hear any speech in this recording.", true);
 
   // 3) Refine with AI (punctuation, Arabic script, paragraphs, headings), guarded against hallucination.
@@ -146,14 +161,14 @@ export async function processClass(row: ClassRow, d: PipelineDeps): Promise<void
     [...raw].sort((a, b) => a.start - b.start).map((s, i) => ({ id: i, start: s.start, end: s.end, speaker: s.speaker, text: s.text, raw: s.text })),
   );
   let sections: Section[] = [];
-  if (d.refiner) {
-    const refiner = d.refiner;
+  if (f.refiner) {
+    const refiner = f.refiner;
     await report("refining", 0.8, "Adding punctuation, paragraphs and Arabic script…");
     const batches = makeBatches(segments, refiner.batchWords);
     let quotaHit = false;
     const saved = await store.listRefineBatches(row.id);
     let finished = saved.size;
-    const results = await mapPool(batches, cfg.refineConcurrency, async (batch, i): Promise<RefineResult | null> => {
+    const results = await mapPool(batches, f.refineConcurrency, async (batch, i): Promise<RefineResult | null> => {
       const cached = saved.get(i);
       // Ignore a cached result if the batch boundaries changed (e.g. a different chunk plan).
       if (cached && cached.segments.some((s) => s.id === batch[0].id)) return cached;
@@ -205,7 +220,6 @@ export async function processClass(row: ClassRow, d: PipelineDeps): Promise<void
     locked_at: null,
     completed_at: new Date().toISOString(),
   });
-  await fs.rm(dir, { recursive: true, force: true });
 }
 
 /** Drop headings that come too soon after the previous one. */

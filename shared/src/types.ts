@@ -61,6 +61,8 @@ export interface ClassRow {
   speaker_names: Record<string, string>;
   /** Private lecture: never send its text to online AI services. */
   ai_opt_out?: boolean;
+  /** "cloud": a public YouTube lecture transcribed online (works with the home computer off). */
+  engine?: "cloud" | "local";
   created_at: string;
   updated_at: string;
 }
