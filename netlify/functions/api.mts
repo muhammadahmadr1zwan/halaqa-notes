@@ -227,8 +227,9 @@ route("POST", "/classes", "user", async (req, _m, s) => {
   const existing = await getJSON<{ id: string }>(s, `yt/${youtube_id}`);
   if (existing && (await getJSON(s, `class/${existing.id}`))) return json({ id: existing.id, existing: true });
   if (await overDailyLimit(s)) return fail(429, `You've added ${DAILY_LIMIT} lectures today. Please add more tomorrow.`);
-  const engine = !ai_opt_out && (await cloudAvailable(s)) ? "cloud" : "local";
-  const row = newClass({ source_type: "youtube", youtube_id, source_url: `https://www.youtube.com/watch?v=${youtube_id}`, ...({ ai_opt_out: !!ai_opt_out, engine } as object) });
+  const privateLecture = ai_opt_out !== false;
+  const engine = !privateLecture && (await cloudAvailable(s)) ? "cloud" : "local";
+  const row = newClass({ source_type: "youtube", youtube_id, source_url: `https://www.youtube.com/watch?v=${youtube_id}`, ...({ ai_opt_out: privateLecture, engine } as object) });
   await putClass(s, row);
   await s.setJSON(`yt/${youtube_id}`, { id: row.id });
   if (engine === "cloud") await kickCloud(s);
@@ -375,10 +376,12 @@ route("POST", "/uploads/:id/complete", "user", async (req, [id], s) => {
   const body = (await req.json().catch(() => ({}))) as { title?: string; class_date?: string | null };
   const row = newClass({
     source_type: "upload",
+    ai_opt_out: true,
     storage_path: id,
     upload_fingerprint: meta.fingerprint,
     title: body.title || meta.name.replace(/\.[^.]+$/, ""),
     class_date: body.class_date ?? null,
+    ...({ ai_opt_out: true, engine: "local" } as object),
   });
   await putClass(s, row);
   await s.setJSON(`fp/${await sha256(meta.fingerprint)}`, { id: row.id });

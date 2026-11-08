@@ -20,7 +20,7 @@ export function classifyYtDlpError(stderr: string): JobError {
   const detail = s.slice(-2000);
   const has = (re: RegExp) => re.test(s);
   if (has(/Private video|This video is private/i))
-    return new JobError("PRIVATE", `This video is private, so it can't be opened. ${UPLOAD_HINT}`, true, detail);
+    return new JobError("PRIVATE", "This video is private. Please upload the audio instead.", true, detail);
   if (has(/members[- ]only|Join this channel/i))
     return new JobError("MEMBERS_ONLY", `This video is for channel members only. ${UPLOAD_HINT}`, true, detail);
   if (has(/live event will begin|Premieres in|is_upcoming|This live stream recording is not available/i))

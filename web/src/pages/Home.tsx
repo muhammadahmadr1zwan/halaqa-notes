@@ -12,7 +12,7 @@ export function Home() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [uploadPct, setUploadPct] = useState<number | null>(null);
-  const [aiOptOut, setAiOptOut] = useState(false);
+  const [aiOptOut, setAiOptOut] = useState(true);
   const fileInput = useRef<HTMLInputElement>(null);
 
   const submit = async () => {

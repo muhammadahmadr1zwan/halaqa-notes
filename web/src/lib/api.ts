@@ -61,7 +61,7 @@ export function useSearch(query: string) {
 }
 
 /** Create (or open the existing) class for a YouTube video. */
-export async function addYouTubeClass(youtubeId: string, aiOptOut = false): Promise<string> {
+export async function addYouTubeClass(youtubeId: string, aiOptOut = true): Promise<string> {
   return (await api<{ id: string }>("/classes", { method: "POST", json: { youtube_id: youtubeId, ai_opt_out: aiOptOut } })).id;
 }
 
